@@ -237,35 +237,6 @@ const https = struct {
     /// stuff.
     pub var trust_anchors: ?ssl.TrustAnchorCollection = null;
 
-    /// Connects a socket to a given host name.
-    /// This should be moved to zig-network when windows-compatible.
-    fn connectToHost(host_name: [:0]const u8, port: u16) !network.Socket {
-        var temp_allocator_buffer: [5000]u8 = undefined;
-        var temp_allocator = std.heap.FixedBufferAllocator.init(&temp_allocator_buffer);
-
-        // var socket = try network.Socket.create(.ipv4, .tcp);
-        // errdefer socket.close();
-        const address_list = try std.net.getAddressList(&temp_allocator.allocator, host_name, port);
-        defer address_list.deinit();
-
-        return for (address_list.addrs) |addr| {
-            var ep = network.EndPoint.fromSocketAddress(&addr.any, addr.getOsSockLen()) catch |err| switch (err) {
-                error.UnsupportedAddressFamily => continue,
-                else => return err,
-            };
-
-            var sock = try network.Socket.create(ep.address, .tcp);
-            errdefer sock.close();
-
-            sock.connect(ep) catch {
-                sock.close();
-                continue;
-            };
-
-            break sock;
-        } else return error.CouldNotConnect;
-    }
-
     fn requestWithStream(allocator: *std.mem.Allocator, url: uri.UriComponents, headers: HeaderMap, input: var, output: var, ssl_stream: ?*ssl.Stream) !Response {
         var http_client = http.Client.init(allocator);
         defer http_client.deinit();
@@ -394,10 +365,10 @@ const https = struct {
 
         const hostname_z = try std.mem.dupeZ(&temp_allocator.allocator, u8, parsed_url.host.?);
 
-        var socket = try connectToHost(hostname_z, switch (protocol) {
+        var socket = try network.connectToHost(allocator, parsed_url.host.?, switch (protocol) {
             .http => @as(u16, 80),
             .https => @as(u16, 443),
-        });
+        }, .tcp);
         defer socket.close();
 
         switch (protocol) {
