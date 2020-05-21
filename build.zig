@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const bear_ssl = @import("zig-bearssl/bearssl.zig");
+const bear_ssl = @import("./lib/zig-bearssl/bearssl.zig");
 
 pub fn build(b: *std.build.Builder) !void {
     const target = b.standardTargetOptions(.{
@@ -18,12 +18,12 @@ pub fn build(b: *std.build.Builder) !void {
     exe.setTarget(target);
     exe.setBuildMode(mode);
 
-    exe.addPackagePath("args", "zig-args/args.zig");
-    exe.addPackagePath("network", "zig-network/network.zig");
-    exe.addPackagePath("bearssl", "zig-bearssl/bearssl.zig");
+    exe.addPackagePath("args", "./lib/zig-args/args.zig");
+    exe.addPackagePath("network", "./lib/zig-network/network.zig");
+    exe.addPackagePath("bearssl", "./lib/zig-bearssl/bearssl.zig");
 
     // this will add all BearSSL sources to the exe
-    bear_ssl.linkBearSSL("./zig-bearssl", exe, target);
+    bear_ssl.linkBearSSL("./lib/zig-bearssl", exe, target);
 
     exe.install();
 
