@@ -10,7 +10,7 @@ fn printUsage() !void {
     const stderr = std.io.getStdErr().outStream();
     try stderr.writeAll(
         \\Usage:
-        \\  zpm [mode] …
+        \\  zpm [mode] ...
         \\Mode may be one of the following:
         \\  help
         \\    Lists this help text
