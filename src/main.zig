@@ -6,14 +6,20 @@ const http = @import("h11");
 const uri = @import("uri");
 
 pub fn main() anyerror!void {
-    const allocator = std.heap.c_allocator;
+    var tester = std.testing.LeakCountAllocator.init(std.heap.c_allocator);
+    defer tester.validate() catch {};
+    // const allocator = std.heap.c_allocator;
+    const allocator = &tester.allocator;
 
     const stdout = std.io.getStdOut().outStream();
     const stderr = std.io.getStdErr().outStream();
     const stdin = std.io.getStdIn().inStream();
 
     https.trust_anchors = ssl.TrustAnchorCollection.init(allocator);
-    defer https.trust_anchors.?.deinit();
+    defer {
+        https.trust_anchors.?.deinit();
+        https.trust_anchors = null;
+    }
 
     // Load default trust anchor for linux
     {
@@ -34,15 +40,26 @@ pub fn main() anyerror!void {
     var response = try https.request(allocator, "https://api.github.com/search/repositories?q=topic:zig-package", &headers);
     defer response.deinit();
 
-    std.debug.warn("status: {}\n", .{response.statusCode});
-    std.debug.warn("headers:\n", .{});
-    for (response.headers) |header| {
-        std.debug.warn("\t{}: {}\n", .{
-            header.name,
-            header.value,
-        });
+    if (response.statusCode == http.StatusCode.Ok) {
+        std.debug.warn("status: {}\n", .{response.statusCode});
+        std.debug.warn("headers:\n", .{});
+        for (response.headers) |header| {
+            std.debug.warn("\t{}: {}\n", .{
+                header.name,
+                header.value,
+            });
+        }
+
+        var parser = std.json.Parser.init(allocator, false); // don't cop strings, we keep the request
+        parser.deinit();
+
+        var tree = try parser.parse(response.body);
+        defer tree.deinit();
+
+        std.debug.warn("body:\n{}\n", .{tree});
+    } else {
+        std.debug.warn("Failed to execute query!\n", .{});
     }
-    std.debug.warn("body:\n{}\n", .{response.body});
 }
 
 const https = struct {
@@ -112,8 +129,6 @@ const https = struct {
         if (url.fragment) |f| {
             target = target.ptr[0..((@ptrToInt(f.ptr) - @ptrToInt(target.ptr)) + f.len)];
         }
-
-        std.debug.warn("full-path: {}\n", .{target});
 
         var requestBytes = try http_client.send(http.Event{
             .Request = http.Request{
