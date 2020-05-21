@@ -1,0 +1,9 @@
+[submodule "zig-network"]
+	path = zig-network
+	url = https://github.com/MasterQ32/zig-network
+[submodule "zig-args"]
+	path = zig-args
+	url = https://github.com/MasterQ32/zig-args
+[submodule "zig-bearssl"]
+	path = zig-bearssl
+	url = https://github.com/MasterQ32/zig-bearssl
