@@ -26,7 +26,12 @@ pub fn main() anyerror!void {
         try https.trust_anchors.?.appendFromPEM(pem_text);
     }
 
-    var response = try https.request(allocator, "http://mq32.de/");
+    var headers = https.HeaderMap.init(allocator);
+    defer headers.deinit();
+
+    try headers.putNoClobber("Accept", "application/vnd.github.mercy-preview+json");
+
+    var response = try https.request(allocator, "https://api.github.com/search/repositories?q=topic:zig-package", &headers);
     defer response.deinit();
 
     std.debug.warn("status: {}\n", .{response.statusCode});
@@ -41,6 +46,8 @@ pub fn main() anyerror!void {
 }
 
 const https = struct {
+    pub const HeaderMap = std.StringHashMap([]const u8);
+
     const empty_trust_anchor_set = ssl.TrustAnchorCollection.init(std.testing.failing_allocator);
 
     /// This contains the TLS trust anchors used to verify servers.
@@ -50,15 +57,13 @@ const https = struct {
 
     /// Connects a socket to a given host name.
     /// This should be moved to zig-network when windows-compatible.
-    fn connectToHost(host_name: []const u8, port: u16) !network.Socket {
+    fn connectToHost(host_name: [:0]const u8, port: u16) !network.Socket {
         var temp_allocator_buffer: [5000]u8 = undefined;
         var temp_allocator = std.heap.FixedBufferAllocator.init(&temp_allocator_buffer);
 
-        const hostname_z = try std.mem.dupeZ(&temp_allocator.allocator, u8, host_name);
-
         // var socket = try network.Socket.create(.ipv4, .tcp);
         // errdefer socket.close();
-        const address_list = try std.net.getAddressList(&temp_allocator.allocator, hostname_z, port);
+        const address_list = try std.net.getAddressList(&temp_allocator.allocator, host_name, port);
         defer address_list.deinit();
 
         return for (address_list.addrs) |addr| {
@@ -79,23 +84,42 @@ const https = struct {
         } else return error.CouldNotConnect;
     }
 
-    fn requestWithStream(allocator: *std.mem.Allocator, url: uri.UriComponents, input: var, output: var, ssl_stream: ?*ssl.Stream) !Response {
+    fn requestWithStream(allocator: *std.mem.Allocator, url: uri.UriComponents, headers: HeaderMap, input: var, output: var, ssl_stream: ?*ssl.Stream) !Response {
         var http_client = http.Client.init(allocator);
         defer http_client.deinit();
 
-        var request_headers = [_]http.HeaderField{
-            http.HeaderField{ .name = "Host", .value = url.host.? },
-            http.HeaderField{ .name = "Accept", .value = "*/*" },
-            http.HeaderField{ .name = "Connection", .value = "close" },
-            // h11.HeaderField{ .name = "Accept", .value = "application/vnd.github.mercy-preview+json" },
-            // h11.HeaderField{ .name = "User-Agent", .value = "h11/0.1.0" },
-        };
+        var request_headers = try allocator.alloc(http.HeaderField, headers.count());
+        defer allocator.free(request_headers);
+
+        var iter = headers.iterator();
+        var i: usize = 0;
+        while (iter.next()) |kv| {
+            request_headers[i] =
+                http.HeaderField{
+                .name = kv.key,
+                .value = kv.value,
+            };
+            i += 1;
+        }
+        std.debug.assert(i == request_headers.len);
+
+        // we know that the URL was parsed from a single string, so
+        // we can reassemble parts of that string again
+        var target = url.path.?;
+        if (url.query) |q| {
+            target = target.ptr[0..((@ptrToInt(q.ptr) - @ptrToInt(target.ptr)) + q.len)];
+        }
+        if (url.fragment) |f| {
+            target = target.ptr[0..((@ptrToInt(f.ptr) - @ptrToInt(target.ptr)) + f.len)];
+        }
+
+        std.debug.warn("full-path: {}\n", .{target});
 
         var requestBytes = try http_client.send(http.Event{
             .Request = http.Request{
                 .method = "GET",
-                .target = url.path.?,
-                .headers = &request_headers,
+                .target = target,
+                .headers = request_headers,
             },
         });
         defer allocator.free(requestBytes);
@@ -114,6 +138,9 @@ const https = struct {
                     http.EventError.NeedData => {
                         var responseBuffer: [4096]u8 = undefined;
                         var nBytes = try input.read(&responseBuffer);
+
+                        // std.debug.warn("input({}) => \"{}\"\n", .{ nBytes, responseBuffer[0..nBytes] });
+
                         try http_client.receiveData(responseBuffer[0..nBytes]);
                         continue;
                     },
@@ -141,7 +168,14 @@ const https = struct {
         }
     }
 
-    pub fn request(allocator: *std.mem.Allocator, url: []const u8) !Response {
+    fn tryInsertHeader(headers: *HeaderMap, key: []const u8, value: []const u8) !void {
+        const gop = try headers.getOrPut(key);
+        if (!gop.found_existing) {
+            gop.kv.value = value;
+        }
+    }
+
+    pub fn request(allocator: *std.mem.Allocator, url: []const u8, headers: ?*HeaderMap) !Response {
         var parsed_url = try uri.parse(url);
         if (parsed_url.scheme == null)
             return error.InvalidUrl;
@@ -149,6 +183,22 @@ const https = struct {
             return error.InvalidUrl;
         if (parsed_url.path == null)
             return error.InvalidUrl;
+
+        var temp_allocator_buffer: [1000]u8 = undefined;
+        var temp_allocator = std.heap.FixedBufferAllocator.init(&temp_allocator_buffer);
+
+        var buffered_headers = HeaderMap.init(&temp_allocator.allocator);
+        defer buffered_headers.deinit();
+
+        const hdrmap = if (headers) |set|
+            set
+        else
+            &buffered_headers;
+
+        try tryInsertHeader(hdrmap, "Host", parsed_url.host.?);
+        try tryInsertHeader(hdrmap, "Accept", "*/*");
+        try tryInsertHeader(hdrmap, "Connection", "close");
+        try tryInsertHeader(hdrmap, "User-Agent", "zpm/1.0.0");
 
         const Protocol = enum {
             http,
@@ -162,7 +212,9 @@ const https = struct {
         else
             return error.UnsupportedProtocol;
 
-        var socket = try connectToHost(parsed_url.host.?, switch (protocol) {
+        const hostname_z = try std.mem.dupeZ(&temp_allocator.allocator, u8, parsed_url.host.?);
+
+        var socket = try connectToHost(hostname_z, switch (protocol) {
             .http => @as(u16, 80),
             .https => @as(u16, 443),
         });
@@ -176,7 +228,7 @@ const https = struct {
                 var ssl_client = ssl.Client.init(x509.getEngine());
                 ssl_client.relocate();
 
-                try ssl_client.reset("mq32.de", false); // pass the hostname here
+                try ssl_client.reset(hostname_z, false); // pass the hostname here
 
                 // this needs to be improved by using actual zig streams
                 var ssl_stream = ssl.Stream.init(ssl_client.getEngine(), socket.internal);
@@ -187,13 +239,13 @@ const https = struct {
                 const ssl_in = ssl_stream.inStream();
                 const ssl_out = ssl_stream.outStream();
 
-                return try requestWithStream(allocator, parsed_url, &ssl_in, &ssl_out, &ssl_stream);
+                return try requestWithStream(allocator, parsed_url, hdrmap.*, &ssl_in, &ssl_out, &ssl_stream);
             },
             .http => {
                 const tcp_in = socket.inStream();
                 const tcp_out = socket.outStream();
 
-                return try requestWithStream(allocator, parsed_url, &tcp_in, &tcp_out, null);
+                return try requestWithStream(allocator, parsed_url, hdrmap.*, &tcp_in, &tcp_out, null);
             },
         }
     }
