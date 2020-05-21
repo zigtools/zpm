@@ -4,61 +4,226 @@ const network = @import("network");
 const ssl = @import("bearssl");
 const http = @import("h11");
 const uri = @import("uri");
+const args_parser = @import("args");
 
-pub fn main() anyerror!void {
-    var tester = std.testing.LeakCountAllocator.init(std.heap.c_allocator);
-    defer tester.validate() catch {};
-    // const allocator = std.heap.c_allocator;
-    const allocator = &tester.allocator;
+fn printUsage() !void {
+    const stderr = std.io.getStdErr().outStream();
+    try stderr.writeAll(
+        \\Usage:
+        \\  zpm [mode] …
+        \\Mode may be one of the following:
+        \\  help
+        \\    Lists this help text
+        \\  search <words>
+        \\    Searches for packages on GitHub. If no <words> are given, *all* packages are listed.
+        \\  install <repo>
+        \\    Installs the repository <repo>. May be only the repo name or the full repository name:
+        \\    (1) `zpm install package-name`
+        \\    (2) `zpm install creator/package-name`
+        \\    When using (1), the package will be installed directly when only one package with that
+        \\    name is found. Otherwise, you will be queried to chose on of the options.
+        \\
+    );
+}
 
+const CliMode = @TagType(CommandLineInterface);
+
+const HelpOptions = struct {};
+const InstallOptions = struct {};
+const SearchOptions = struct {};
+const UninstallOptions = struct {};
+
+const CommandLineInterface = union(enum) {
+    help: args_parser.ParseArgsResult(HelpOptions),
+    install: args_parser.ParseArgsResult(InstallOptions),
+    search: args_parser.ParseArgsResult(SearchOptions),
+    uninstall: args_parser.ParseArgsResult(UninstallOptions),
+
+    fn deinit(self: @This()) void {
+        switch (self) {
+            .help => |v| v.deinit(),
+            .install => |v| v.deinit(),
+            .search => |v| v.deinit(),
+            .uninstall => |v| v.deinit(),
+        }
+    }
+};
+
+pub fn main() anyerror!u8 {
     const stdout = std.io.getStdOut().outStream();
     const stderr = std.io.getStdErr().outStream();
     const stdin = std.io.getStdIn().inStream();
 
-    https.trust_anchors = ssl.TrustAnchorCollection.init(allocator);
-    defer {
-        https.trust_anchors.?.deinit();
-        https.trust_anchors = null;
-    }
+    var tester = std.testing.LeakCountAllocator.init(std.heap.c_allocator);
+    defer tester.validate() catch {};
 
-    // Load default trust anchor for linux
+    const allocator = if (std.builtin.mode == .Debug)
+        &tester.allocator
+    else
+        std.heap.c_allocator;
+
+    var args = std.process.args();
+
+    // Ignore executable name for now…
     {
-        var file = try std.fs.cwd().openFile("/etc/ssl/cert.pem", .{ .read = true, .write = false });
-        defer file.close();
-
-        const pem_text = try file.inStream().readAllAlloc(allocator, 1 << 20); // 1 MB
-        defer allocator.free(pem_text);
-
-        try https.trust_anchors.?.appendFromPEM(pem_text);
+        const executable_name = try (args.next(allocator) orelse {
+            try std.io.getStdErr().outStream().writeAll("Failed to get executable name from the argument list!\n");
+            return error.NoExecutableName;
+        });
+        allocator.free(executable_name);
     }
 
-    var headers = https.HeaderMap.init(allocator);
-    defer headers.deinit();
+    const mode = blk: {
+        const mode_name = try (args.next(allocator) orelse {
+            try printUsage();
+            return 1;
+        });
+        defer allocator.free(mode_name);
 
-    try headers.putNoClobber("Accept", "application/vnd.github.mercy-preview+json");
-
-    var response = try https.request(allocator, "https://api.github.com/search/repositories?q=topic:zig-package", &headers);
-    defer response.deinit();
-
-    if (response.statusCode == http.StatusCode.Ok) {
-        std.debug.warn("status: {}\n", .{response.statusCode});
-        std.debug.warn("headers:\n", .{});
-        for (response.headers) |header| {
-            std.debug.warn("\t{}: {}\n", .{
-                header.name,
-                header.value,
+        break :blk std.meta.stringToEnum(CliMode, mode_name) orelse {
+            try stderr.print("Unknown mode: {}\n", .{
+                mode_name,
             });
+            return 1;
+        };
+    };
+
+    const base_cli: CommandLineInterface = switch (mode) {
+        .help => CommandLineInterface{
+            .help = try args_parser.parse(HelpOptions, &args, allocator),
+        },
+        .search => CommandLineInterface{
+            .search = try args_parser.parse(SearchOptions, &args, allocator),
+        },
+        .install => CommandLineInterface{
+            .install = try args_parser.parse(InstallOptions, &args, allocator),
+        },
+        .uninstall => CommandLineInterface{
+            .uninstall = try args_parser.parse(UninstallOptions, &args, allocator),
+        },
+    };
+    defer base_cli.deinit();
+
+    switch (base_cli) {
+        .help => |cli| {
+            try printUsage();
+            return 0;
+        },
+
+        .search => |cli| {
+            // this requires usage of HTTPS
+            https.trust_anchors = ssl.TrustAnchorCollection.init(allocator);
+            defer {
+                https.trust_anchors.?.deinit();
+                https.trust_anchors = null;
+            }
+
+            // Load default trust anchor for linux
+            {
+                var file = try std.fs.cwd().openFile("/etc/ssl/cert.pem", .{ .read = true, .write = false });
+                defer file.close();
+
+                const pem_text = try file.inStream().readAllAlloc(allocator, 1 << 20); // 1 MB
+                defer allocator.free(pem_text);
+
+                try https.trust_anchors.?.appendFromPEM(pem_text);
+            }
+
+            var headers = https.HeaderMap.init(allocator);
+            defer headers.deinit();
+
+            try headers.putNoClobber("Accept", "application/vnd.github.mercy-preview+json");
+
+            var response = try https.request(allocator, "https://api.github.com/search/repositories?q=topic:zig-package", &headers);
+            defer response.deinit();
+
+            if (response.statusCode == http.StatusCode.Ok) {
+                var parser = std.json.Parser.init(allocator, false); // don't cop strings, we keep the request
+                parser.deinit();
+
+                var tree = try parser.parse(response.body);
+                defer tree.deinit();
+
+                printPackages(tree.root) catch |err| switch (err) {
+                    error.UnexpectedValue => {
+                        std.debug.warn("Got invalid JSON!\n", .{});
+                    },
+                    else => return err,
+                };
+
+                // std.debug.warn("body:\n{}\n", .{tree});
+            } else {
+                std.debug.warn("Failed to execute query:\n", .{});
+
+                std.debug.warn("status: {}\n", .{response.statusCode});
+                std.debug.warn("headers:\n", .{});
+                for (response.headers) |header| {
+                    std.debug.warn("\t{}: {}\n", .{
+                        header.name,
+                        header.value,
+                    });
+                }
+            }
+        },
+
+        .install => |cli| {
+            if (cli.positionals.len == 0) {
+                try printUsage();
+                return 1;
+            }
+
+            for (cli.positionals) |repo_spec| {
+                if (std.mem.indexOf(u8, repo_spec, "/")) |split| {
+                    const owner = repo_spec[0..split];
+                    const repo = repo_spec[split + 1 ..];
+
+                    std.debug.warn("Install (1) {}/{}\n", .{
+                        owner,
+                        repo,
+                    });
+                } else {
+                    const repo = repo_spec;
+
+                    std.debug.warn("Install (2) {}/{}\n", .{
+                        "???",
+                        repo,
+                    });
+                }
+            }
+        },
+
+        .uninstall => |cli| {},
+    }
+
+    return 0;
+}
+
+fn printPackages(root: std.json.Value) !void {
+    if (root != .Object)
+        return error.UnexpectedValue;
+    if (root.Object.get("items")) |items_kv| {
+        if (items_kv.value != .Array)
+            return error.UnexpectedValue;
+
+        for (items_kv.value.Array.items) |repo_val| {
+            if (repo_val != .Object)
+                return error.UnexpectedValue;
+            const repo = &repo_val.Object;
+
+            const licence = repo.get("license").?.value;
+            if (licence == .Null) {
+                std.debug.warn("{} (no licence)\n", .{
+                    repo.get("full_name").?.value.String,
+                });
+            } else {
+                std.debug.warn("{} ({})\n", .{
+                    repo.get("full_name").?.value.String,
+                    licence.Object.get("name").?.value.String,
+                });
+            }
         }
-
-        var parser = std.json.Parser.init(allocator, false); // don't cop strings, we keep the request
-        parser.deinit();
-
-        var tree = try parser.parse(response.body);
-        defer tree.deinit();
-
-        std.debug.warn("body:\n{}\n", .{tree});
     } else {
-        std.debug.warn("Failed to execute query!\n", .{});
+        return error.UnexpectedValue;
     }
 }
 
