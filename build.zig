@@ -20,6 +20,7 @@ pub fn build(b: *std.build.Builder) !void {
     exe.addPackagePath("args", "./lib/zig-args/args.zig");
     exe.addPackagePath("network", "./lib/zig-network/network.zig");
     exe.addPackagePath("bearssl", "./lib/zig-bearssl/bearssl.zig");
+    exe.addPackagePath("uri", "./lib/zig-uri/uri.zig");
     exe.addPackagePath("h11", "./lib/h11/src/main.zig");
 
     // this will add all BearSSL sources to the exe
