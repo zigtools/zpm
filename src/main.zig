@@ -2,6 +2,7 @@ const std = @import("std");
 
 const network = @import("network");
 const ssl = @import("bearssl");
+const http = @import("h11");
 
 pub fn main() anyerror!void {
     const allocator = std.heap.c_allocator;
@@ -51,20 +52,89 @@ pub fn main() anyerror!void {
     const ssl_in = ssl_stream.inStream();
     const ssl_out = ssl_stream.outStream();
 
-    try ssl_out.writeAll(
-        \\GET /index.htm HTTP/1.0
-        \\Host: mq32.de
-        \\
-        \\
-    );
+    var http_client = http.Client.init(allocator);
+    defer http_client.deinit();
+
+    var request_headers = [_]http.HeaderField{
+        http.HeaderField{ .name = "Host", .value = "mq32.de" },
+        http.HeaderField{ .name = "Accept", .value = "*/*" },
+        http.HeaderField{ .name = "Connection", .value = "close" },
+        // h11.HeaderField{ .name = "Accept", .value = "application/vnd.github.mercy-preview+json" },
+        // h11.HeaderField{ .name = "User-Agent", .value = "h11/0.1.0" },
+    };
+
+    var request = http.Request{
+        .method = "GET",
+        .target = "/",
+        .headers = &request_headers,
+    };
+
+    var requestBytes = try http_client.send(http.Event{
+        .Request = request,
+    });
+    defer allocator.free(requestBytes);
+
+    try ssl_out.writeAll(requestBytes);
     try ssl_stream.flush();
 
-    var work_buf: [2048]u8 = undefined;
+    const Response = struct {
+        statusCode: http.StatusCode,
+        headers: []http.HeaderField,
+        body: []const u8,
+
+        // `buffer` stores the bytes read from the socket.
+        // This allow to keep `headers` and `body` fields accessible after
+        // the client  connection is deinitialized.
+        buffer: []const u8,
+    };
+
+    var response = Response{
+        .statusCode = undefined,
+        .headers = undefined,
+        .body = undefined,
+        .buffer = undefined,
+    };
 
     while (true) {
-        const size = try ssl_in.read(&work_buf);
-        if (size == 0)
-            break;
-        try stdout.writeAll(work_buf[0..size]);
+        var event: http.Event = while (true) {
+            var event = http_client.nextEvent() catch |err| switch (err) {
+                http.EventError.NeedData => {
+                    var responseBuffer: [4096]u8 = undefined;
+                    var nBytes = try ssl_in.read(&responseBuffer);
+                    try http_client.receiveData(responseBuffer[0..nBytes]);
+                    continue;
+                },
+                else => {
+                    return err;
+                },
+            };
+            break event;
+        } else unreachable;
+
+        switch (event) {
+            .Response => |*responseEvent| {
+                response.statusCode = responseEvent.statusCode;
+                response.headers = responseEvent.headers;
+            },
+            .Data => |*dataEvent| {
+                response.body = dataEvent.body;
+            },
+            .EndOfMessage => {
+                response.buffer = http_client.buffer.toOwnedSlice();
+                break;
+            },
+            else => unreachable,
+        }
     }
+    defer allocator.free(response.buffer);
+
+    std.debug.warn("status: {}\n", .{response.statusCode});
+    std.debug.warn("headers:\n", .{});
+    for (response.headers) |header| {
+        std.debug.warn("\t{}: {}\n", .{
+            header.name,
+            header.value,
+        });
+    }
+    std.debug.warn("body:\n{}\n", .{response.body});
 }

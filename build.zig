@@ -5,8 +5,7 @@ const bear_ssl = @import("./lib/zig-bearssl/bearssl.zig");
 pub fn build(b: *std.build.Builder) !void {
     const target = b.standardTargetOptions(.{
         .default_target = try std.zig.CrossTarget.parse(.{
-            .arch_os_abi = "native-linux", // we need at least glibc 2.25 for getentropy
-            // .arch_os_abi = "native-native-musl", // preferrable, but doesn't work?!
+            .arch_os_abi = "x86_64-linux-musl", // preferrable, but doesn't work?!
         }),
     });
 
@@ -21,6 +20,7 @@ pub fn build(b: *std.build.Builder) !void {
     exe.addPackagePath("args", "./lib/zig-args/args.zig");
     exe.addPackagePath("network", "./lib/zig-network/network.zig");
     exe.addPackagePath("bearssl", "./lib/zig-bearssl/bearssl.zig");
+    exe.addPackagePath("h11", "./lib/h11/src/main.zig");
 
     // this will add all BearSSL sources to the exe
     bear_ssl.linkBearSSL("./lib/zig-bearssl", exe, target);
