@@ -49,10 +49,15 @@ const CommandLineInterface = union(enum) {
     }
 };
 
+var debug_file: std.fs.File = undefined;
+
 pub fn main() anyerror!u8 {
     const stdout = std.io.getStdOut().outStream();
     const stderr = std.io.getStdErr().outStream();
     const stdin = std.io.getStdIn().inStream();
+
+    debug_file = try std.fs.cwd().createFile("raw.txt", .{});
+    defer debug_file.close();
 
     var tester = std.testing.LeakCountAllocator.init(std.heap.c_allocator);
     defer tester.validate() catch {};
@@ -136,6 +141,13 @@ pub fn main() anyerror!u8 {
 
             var response = try https.request(allocator, "https://api.github.com/search/repositories?q=topic:zig-package", &headers);
             defer response.deinit();
+
+            // {
+            //     var file = try std.fs.cwd().createFile("request.txt", .{ .exclusive = false });
+            //     defer file.close();
+
+            //     try file.writeAll(response.buffer);
+            // }
 
             if (response.statusCode == http.StatusCode.Ok) {
                 var parser = std.json.Parser.init(allocator, false); // don't cop strings, we keep the request
@@ -288,11 +300,20 @@ const https = struct {
                 var event = http_client.nextEvent() catch |err| switch (err) {
                     http.EventError.NeedData => {
                         var responseBuffer: [4096]u8 = undefined;
-                        var nBytes = try input.read(&responseBuffer);
 
-                        // std.debug.warn("input({}) => \"{}\"\n", .{ nBytes, responseBuffer[0..nBytes] });
+                        while (true) {
+                            var nBytes = try input.read(&responseBuffer);
+                            if (nBytes == 0)
+                                break;
 
-                        try http_client.receiveData(responseBuffer[0..nBytes]);
+                            const slice = responseBuffer[0..nBytes];
+
+                            try debug_file.writeAll(slice);
+
+                            // std.debug.warn("input({}) => \"{}\"\n", .{ nBytes, responseBuffer[0..nBytes] });
+
+                            try http_client.receiveData(slice);
+                        }
                         continue;
                     },
                     else => {
@@ -301,6 +322,10 @@ const https = struct {
                 };
                 break event;
             } else unreachable;
+
+            std.debug.warn("http event: {}\n", .{
+                @as(http.EventTag, event),
+            });
 
             switch (event) {
                 .Response => |*responseEvent| {
