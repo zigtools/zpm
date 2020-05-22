@@ -249,7 +249,7 @@ const https = struct {
     /// stuff.
     pub var trust_anchors: ?ssl.TrustAnchorCollection = null;
 
-    fn requestWithStream(allocator: *std.mem.Allocator, url: uri.UriComponents, headers: HeaderMap, input: var, output: var, ssl_stream: ?*ssl.Stream) !Response {
+    fn requestWithStream(allocator: *std.mem.Allocator, url: uri.UriComponents, headers: HeaderMap, io_handler: var) !Response {
         var http_client = http.Client.init(allocator);
         defer http_client.deinit();
 
@@ -287,11 +287,9 @@ const https = struct {
         });
         defer allocator.free(requestBytes);
 
-        try output.writeAll(requestBytes);
+        try io_handler.output.writeAll(requestBytes);
 
-        if (ssl_stream) |stream| {
-            try stream.flush();
-        }
+        try io_handler.flush();
 
         var response = Response.init(allocator);
 
@@ -302,7 +300,7 @@ const https = struct {
                         var responseBuffer: [4096]u8 = undefined;
 
                         while (true) {
-                            var nBytes = try input.read(&responseBuffer);
+                            var nBytes = try io_handler.input.read(&responseBuffer);
                             if (nBytes == 0)
                                 break;
 
@@ -372,9 +370,10 @@ const https = struct {
             &buffered_headers;
 
         try tryInsertHeader(hdrmap, "Host", parsed_url.host.?);
-        try tryInsertHeader(hdrmap, "Accept", "*/*");
-        try tryInsertHeader(hdrmap, "Connection", "close");
-        try tryInsertHeader(hdrmap, "User-Agent", "zpm/1.0.0");
+        try tryInsertHeader(hdrmap, "Accept", "*/*"); // We are generous
+        try tryInsertHeader(hdrmap, "Connection", "close"); // we want the data to end
+        try tryInsertHeader(hdrmap, "User-Agent", "zpm/1.0.0"); // we are ZPM
+        try tryInsertHeader(hdrmap, "Accept-Encoding", "identity"); // we can only read non-chunked data
 
         const Protocol = enum {
             http,
@@ -396,6 +395,9 @@ const https = struct {
         }, .tcp);
         defer socket.close();
 
+        var tcp_in = socket.inStream();
+        var tcp_out = socket.outStream();
+
         switch (protocol) {
             .https => {
                 // When we have no global trust anchors, use empty ones.
@@ -407,21 +409,43 @@ const https = struct {
                 try ssl_client.reset(hostname_z, false); // pass the hostname here
 
                 // this needs to be improved by using actual zig streams
-                var ssl_stream = ssl.Stream.init(ssl_client.getEngine(), socket.internal);
+                var ssl_stream = ssl.initStream(
+                    ssl_client.getEngine(),
+                    &tcp_in,
+                    &tcp_out,
+                );
                 defer if (ssl_stream.close()) {} else |err| {
                     std.debug.warn("error when closing the stream: {}\n", .{err});
                 };
 
-                const ssl_in = ssl_stream.inStream();
-                const ssl_out = ssl_stream.outStream();
+                var ssl_in = ssl_stream.inStream();
+                var ssl_out = ssl_stream.outStream();
 
-                return try requestWithStream(allocator, parsed_url, hdrmap.*, &ssl_in, &ssl_out, &ssl_stream);
+                const IO = struct {
+                    ssl: *@TypeOf(ssl_stream),
+                    input: @TypeOf(ssl_in),
+                    output: @TypeOf(ssl_out),
+                    fn flush(self: @This()) !void {
+                        try self.ssl.flush();
+                    }
+                };
+
+                return try requestWithStream(allocator, parsed_url, hdrmap.*, IO{
+                    .ssl = &ssl_stream,
+                    .input = ssl_in,
+                    .output = ssl_out,
+                });
             },
             .http => {
-                const tcp_in = socket.inStream();
-                const tcp_out = socket.outStream();
-
-                return try requestWithStream(allocator, parsed_url, hdrmap.*, &tcp_in, &tcp_out, null);
+                const IO = struct {
+                    input: @TypeOf(tcp_in),
+                    output: @TypeOf(tcp_out),
+                    fn flush(self: @This()) !void {}
+                };
+                return try requestWithStream(allocator, parsed_url, hdrmap.*, IO{
+                    .input = tcp_in,
+                    .output = tcp_out,
+                });
             },
         }
     }
