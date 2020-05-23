@@ -64,6 +64,17 @@ pub fn main() anyerror!u8 {
     try network.init();
     defer network.deinit();
 
+    // this requires usage of HTTPS
+    https.trust_anchors = ssl.TrustAnchorCollection.init(allocator);
+    defer {
+        https.trust_anchors.?.deinit();
+        https.trust_anchors = null;
+    }
+
+    // Just embed our trust_anchor into the binary...
+    // Not perfect, but will work for now.
+    try https.trust_anchors.?.appendFromPEM(@embedFile("../data/ca.pem"));
+
     var exe_dir = (try known_folders.open(allocator, .executable_dir, .{})) orelse unreachable; // this path does always exist
     defer exe_dir.close();
 
@@ -123,82 +134,27 @@ pub fn main() anyerror!u8 {
         },
 
         .search => |cli| {
-            // this requires usage of HTTPS
-            https.trust_anchors = ssl.TrustAnchorCollection.init(allocator);
-            defer {
-                https.trust_anchors.?.deinit();
-                https.trust_anchors = null;
-            }
-
-            // Load default trust anchor for linux
-            if (std.builtin.os.tag == .windows) {
-                // Just embed our trust_anchor into the binary...
-                // Not perfect, but will work for now.
-                try https.trust_anchors.?.appendFromPEM(@embedFile("../data/ca.pem"));
-            } else {
-                var file = try exe_dir.openFile("/etc/ssl/cert.pem", .{ .read = true, .write = false });
-                defer file.close();
-
-                const pem_text = try file.inStream().readAllAlloc(allocator, 1 << 20); // 1 MB
-                defer allocator.free(pem_text);
-
-                try https.trust_anchors.?.appendFromPEM(pem_text);
-            }
-
             var headers = https.HeaderMap.init(allocator);
             defer headers.deinit();
 
-            try headers.putNoClobber("Accept", "application/vnd.github.mercy-preview+json");
+            var packages = queryPackages(allocator, cli.positionals) catch |err| switch (err) {
+                error.UnexpectedValue => {
+                    try stderr.writeAll("Received a JSON structure that does not fit the previous API structure.\nGitHub may have changed something in their API!");
+                    return 1;
+                },
+                else => return err,
+            };
+            defer packages.deinit();
 
-            var string_arena = std.heap.ArenaAllocator.init(allocator);
-            defer string_arena.deinit();
+            for (packages.items) |pkg| {
+                const lic = pkg.licence orelse @as([]const u8, "no licence");
+                const desc = pkg.description orelse "no description";
 
-            var header_set = try string_arena.allocator.alloc([]const u8, 1 + 2 * cli.positionals.len);
-            header_set[0] = "https://api.github.com/search/repositories?q=topic:zig-package";
-
-            for (cli.positionals) |search_text, i| {
-                header_set[2 * i + 1] = "%20";
-                header_set[2 * i + 2] = try uri.escapeString(&string_arena.allocator, search_text);
-            }
-
-            const request_string = try std.mem.concat(&string_arena.allocator, u8, header_set);
-
-            var response = try https.request(allocator, request_string, &headers);
-            defer response.deinit();
-
-            // {
-            //     var file = try std.fs.cwd().createFile("request.txt", .{ .exclusive = false });
-            //     defer file.close();
-
-            //     try file.writeAll(response.buffer);
-            // }
-
-            if (response.statusCode == http.StatusCode.Ok) {
-                var parser = std.json.Parser.init(allocator, false); // don't cop strings, we keep the request
-                parser.deinit();
-
-                var tree = try parser.parse(response.body);
-                defer tree.deinit();
-
-                printPackages(tree.root) catch |err| switch (err) {
-                    error.UnexpectedValue => {
-                        std.debug.warn("Got invalid JSON!\n", .{});
-                    },
-                    else => return err,
-                };
-
-                // std.debug.warn("body:\n{}\n", .{tree});
-            } else {
-                std.debug.warn("Failed to execute query:\n", .{});
-
-                std.debug.warn("status: {}\n", .{response.statusCode});
-                std.debug.warn("headers:\n", .{});
-                for (response.headers) |header| {
-                    std.debug.warn("\t{}: {}\n", .{
-                        header.name,
-                        header.value,
-                    });
-                }
+                try stdout.print("{} ({})\n\t{}\n", .{
+                    pkg.full_name,
+                    lic,
+                    desc,
+                });
             }
         },
 
@@ -219,10 +175,62 @@ pub fn main() anyerror!u8 {
                 } else {
                     const repo = repo_spec;
 
-                    std.debug.warn("Install (2) {}/{}\n", .{
-                        "???",
-                        repo,
-                    });
+                    var packages = queryPackages(allocator, cli.positionals) catch |err| switch (err) {
+                        error.UnexpectedValue => {
+                            try stderr.writeAll("Received a JSON structure that does not fit the previous API structure.\nGitHub may have changed something in their API!");
+                            return 1;
+                        },
+                        else => return err,
+                    };
+                    defer packages.deinit();
+
+                    switch (packages.items.len) {
+                        0 => {
+                            try stderr.print("Package {} not found!\n", .{repo});
+                            return 1;
+                        },
+                        1 => {
+                            try installPackage(allocator, std.fs.cwd(), packages.items[0].full_name);
+                        },
+                        else => {
+                            try stdout.writeAll("Multiple packages were found. Chose one of those:\n");
+
+                            for (packages.items) |pkg, i| {
+                                const lic = pkg.licence orelse @as([]const u8, "no licence");
+
+                                try stdout.print("[{}]\t{} ({})\n", .{
+                                    i,
+                                    pkg.full_name,
+                                    lic,
+                                });
+                            }
+
+                            var number_buf: [128]u8 = undefined;
+
+                            const package_id = while (true) {
+                                try stdout.writeAll("select package: ");
+                                const num_or_null = try stdin.readUntilDelimiterOrEof(&number_buf, '\n');
+                                if (num_or_null) |num_str| {
+                                    if (num_str.len == 0) {
+                                        return 1;
+                                    }
+                                    const index = std.fmt.parseInt(usize, num_str, 10) catch |err| {
+                                        try stdout.writeAll("Input a number or empty string!\n");
+                                        continue;
+                                    };
+                                    if (index >= packages.items.len) {
+                                        try stdout.writeAll("Index out of range. Input a number or empty string!\n");
+                                        continue;
+                                    }
+                                    break index;
+                                } else {
+                                    return 1;
+                                }
+                            } else unreachable;
+
+                            try installPackage(allocator, std.fs.cwd(), packages.items[package_id].full_name);
+                        },
+                    }
                 }
             }
         },
@@ -233,6 +241,119 @@ pub fn main() anyerror!u8 {
     }
 
     return 0;
+}
+
+const Package = struct {
+    name: []const u8,
+    full_name: []const u8,
+    description: ?[]const u8,
+    licence: ?[]const u8,
+};
+
+const PackageCollection = struct {
+    arena: std.heap.ArenaAllocator,
+    items: []Package,
+
+    fn deinit(self: @This()) void {
+        self.arena.deinit();
+    }
+};
+
+fn queryPackages(allocator: *std.mem.Allocator, keywords: []const []const u8) !PackageCollection {
+    var headers = https.HeaderMap.init(allocator);
+    defer headers.deinit();
+
+    try headers.putNoClobber("Accept", "application/vnd.github.mercy-preview+json");
+
+    var string_arena = std.heap.ArenaAllocator.init(allocator);
+    defer string_arena.deinit();
+
+    var header_set = try string_arena.allocator.alloc([]const u8, 1 + 2 * keywords.len);
+    header_set[0] = "https://api.github.com/search/repositories?q=topic:zig-package";
+
+    for (keywords) |search_text, i| {
+        header_set[2 * i + 1] = "%20";
+        header_set[2 * i + 2] = try uri.escapeString(&string_arena.allocator, search_text);
+    }
+
+    const request_string = try std.mem.concat(&string_arena.allocator, u8, header_set);
+
+    var response = try https.request(allocator, request_string, &headers);
+    defer response.deinit();
+
+    // {
+    //     var file = try std.fs.cwd().createFile("request.txt", .{ .exclusive = false });
+    //     defer file.close();
+
+    //     try file.writeAll(response.buffer);
+    // }
+
+    if (response.statusCode == http.StatusCode.Ok) {
+        var parser = std.json.Parser.init(allocator, false); // don't copy strings, we keep the request
+        parser.deinit();
+
+        var tree = try parser.parse(response.body);
+        defer tree.deinit();
+
+        return try parsePackages(allocator, tree.root);
+    } else {
+        std.debug.warn("Failed to execute query:\n", .{});
+
+        std.debug.warn("status: {}\n", .{response.statusCode});
+        std.debug.warn("headers:\n", .{});
+        for (response.headers) |header| {
+            std.debug.warn("\t{}: {}\n", .{
+                header.name,
+                header.value,
+            });
+        }
+
+        return error.UnexpectedServerResponse;
+    }
+}
+
+fn parsePackages(allocator: *std.mem.Allocator, root: std.json.Value) !PackageCollection {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+
+    if (root != .Object)
+        return error.UnexpectedValue;
+    if (root.Object.get("items")) |items_kv| {
+        if (items_kv.value != .Array)
+            return error.UnexpectedValue;
+
+        const result = try allocator.alloc(Package, items_kv.value.Array.items.len);
+
+        for (items_kv.value.Array.items) |repo_val, i| {
+            if (repo_val != .Object)
+                return error.UnexpectedValue;
+            const repo = &repo_val.Object;
+
+            const pkg = &result[i];
+            pkg.* = Package{
+                .name = try std.mem.dupe(&arena.allocator, u8, repo.get("name").?.value.String),
+                .full_name = try std.mem.dupe(&arena.allocator, u8, repo.get("full_name").?.value.String),
+                .description = null,
+                .licence = null,
+            };
+
+            const licence = repo.get("license").?.value;
+            if (licence == .Object) {
+                pkg.licence = try std.mem.dupe(&arena.allocator, u8, licence.Object.get("name").?.value.String);
+            }
+
+            if (repo.get("description")) |description| {
+                pkg.description = try std.mem.dupe(&arena.allocator, u8, description.value.String);
+            }
+        }
+
+        return PackageCollection{
+            .arena = arena,
+            .items = result,
+        };
+    } else {
+        return error.UnexpectedValue;
+    }
 }
 
 fn printPackages(root: std.json.Value) !void {
