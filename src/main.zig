@@ -131,8 +131,12 @@ pub fn main() anyerror!u8 {
             }
 
             // Load default trust anchor for linux
-            {
-                var file = try exe_dir.openFile("../data/ca.pem", .{ .read = true, .write = false });
+            if (std.builtin.os.tag == .windows) {
+                // Just embed our trust_anchor into the binary...
+                // Not perfect, but will work for now.
+                try https.trust_anchors.?.appendFromPEM(@embedFile("../data/ca.pem"));
+            } else {
+                var file = try exe_dir.openFile("/etc/ssl/cert.pem", .{ .read = true, .write = false });
                 defer file.close();
 
                 const pem_text = try file.inStream().readAllAlloc(allocator, 1 << 20); // 1 MB

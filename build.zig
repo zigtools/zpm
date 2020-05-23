@@ -32,8 +32,6 @@ pub fn build(b: *std.build.Builder) !void {
 
     exe.install();
 
-    b.installFile("./data/ca.pem", "data/ca.pem");
-
     const run_cmd = exe.run();
     run_cmd.step.dependOn(b.getInstallStep());
 
