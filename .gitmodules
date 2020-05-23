@@ -13,3 +13,6 @@
 [submodule "lib/zig-uri"]
 	path = lib/zig-uri
 	url = https://github.com/MasterQ32/zig-uri
+[submodule "lib/known-folders"]
+	path = lib/known-folders
+	url = https://github.com/ziglibs/known-folders

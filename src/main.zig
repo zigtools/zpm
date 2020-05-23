@@ -5,6 +5,7 @@ const ssl = @import("bearssl");
 const http = @import("h11");
 const uri = @import("uri");
 const args_parser = @import("args");
+const known_folders = @import("known-folders");
 
 fn printUsage() !void {
     const stderr = std.io.getStdErr().outStream();
@@ -49,16 +50,9 @@ const CommandLineInterface = union(enum) {
     }
 };
 
-var debug_file: std.fs.File = undefined;
+var debug_file: ?std.fs.File = null;
 
 pub fn main() anyerror!u8 {
-    const stdout = std.io.getStdOut().outStream();
-    const stderr = std.io.getStdErr().outStream();
-    const stdin = std.io.getStdIn().inStream();
-
-    debug_file = try std.fs.cwd().createFile("raw.txt", .{});
-    defer debug_file.close();
-
     var tester = std.testing.LeakCountAllocator.init(std.heap.c_allocator);
     defer tester.validate() catch {};
 
@@ -66,6 +60,19 @@ pub fn main() anyerror!u8 {
         &tester.allocator
     else
         std.heap.c_allocator;
+
+    try network.init();
+    defer network.deinit();
+
+    var exe_dir = (try known_folders.open(allocator, .executable_dir, .{})) orelse unreachable; // this path does always exist
+    defer exe_dir.close();
+
+    const stdout = std.io.getStdOut().outStream();
+    const stderr = std.io.getStdErr().outStream();
+    const stdin = std.io.getStdIn().inStream();
+
+    // debug_file = try std.fs.cwd().createFile("raw.txt", .{});
+    // defer debug_file.close();
 
     var args = std.process.args();
 
@@ -125,7 +132,7 @@ pub fn main() anyerror!u8 {
 
             // Load default trust anchor for linux
             {
-                var file = try std.fs.cwd().openFile("/etc/ssl/cert.pem", .{ .read = true, .write = false });
+                var file = try exe_dir.openFile("../data/ca.pem", .{ .read = true, .write = false });
                 defer file.close();
 
                 const pem_text = try file.inStream().readAllAlloc(allocator, 1 << 20); // 1 MB
@@ -386,7 +393,9 @@ const https = struct {
 
                             const slice = responseBuffer[0..nBytes];
 
-                            try debug_file.writeAll(slice);
+                            if (debug_file) |*file| {
+                                try file.writeAll(slice);
+                            }
 
                             // std.debug.warn("input({}) => \"{}\"\n", .{ nBytes, responseBuffer[0..nBytes] });
 

@@ -22,11 +22,14 @@ pub fn build(b: *std.build.Builder) !void {
     exe.addPackagePath("bearssl", "./lib/zig-bearssl/bearssl.zig");
     exe.addPackagePath("uri", "./lib/zig-uri/uri.zig");
     exe.addPackagePath("h11", "./lib/h11/src/main.zig");
+    exe.addPackagePath("known-folders", "./lib/known-folders/known-folders.zig");
 
     // this will add all BearSSL sources to the exe
     bear_ssl.linkBearSSL("./lib/zig-bearssl", exe, target);
 
     exe.install();
+
+    b.installFile("./data/ca.pem", "data/ca.pem");
 
     const run_cmd = exe.run();
     run_cmd.step.dependOn(b.getInstallStep());
