@@ -5,7 +5,10 @@ const bear_ssl = @import("./lib/zig-bearssl/bearssl.zig");
 pub fn build(b: *std.build.Builder) !void {
     const target = b.standardTargetOptions(.{
         .default_target = try std.zig.CrossTarget.parse(.{
-            .arch_os_abi = "x86_64-linux-musl", // preferrable, but doesn't work?!
+            .arch_os_abi = if (std.builtin.os.tag == .windows)
+                "native-native-gnu" // on windows, use gnu by default
+            else
+                "native-linux-musl", // glibc has some problems by-default, use musl instead
         }),
     });
 
