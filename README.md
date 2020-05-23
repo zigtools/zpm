@@ -1,7 +1,10 @@
 # Inofficial Package Manager for Zig
 
-**DISCLAIMER**:
+**DISCLAIMER 1**:
 This is not an official package manager for Zig. It's just something to bridge the time between *now* and the official package manager release.
+
+**DISCLAIMER 2**:
+Package versioning is out of scope for ZPM. Having "stable" packages for an unstable programming language seems unreasonable to me. Zig will still have frequent breaking changes, so keeping *all* our dependencies up-to-date is imho a must.
 
 ## Concept
 
