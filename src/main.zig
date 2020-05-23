@@ -73,7 +73,9 @@ pub fn main() anyerror!u8 {
 
     // Just embed our trust_anchor into the binary...
     // Not perfect, but will work for now.
-    try https.trust_anchors.?.appendFromPEM(@embedFile("../data/ca.pem"));
+    try https.trust_anchors.?.appendFromPEM(
+        @embedFile("../data/digi-cert-github-chain.pem"),
+    );
 
     var exe_dir = (try known_folders.open(allocator, .executable_dir, .{})) orelse unreachable; // this path does always exist
     defer exe_dir.close();
