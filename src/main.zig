@@ -139,7 +139,20 @@ pub fn main() anyerror!u8 {
 
             try headers.putNoClobber("Accept", "application/vnd.github.mercy-preview+json");
 
-            var response = try https.request(allocator, "https://api.github.com/search/repositories?q=topic:zig-package", &headers);
+            var string_arena = std.heap.ArenaAllocator.init(allocator);
+            defer string_arena.deinit();
+
+            var header_set = try string_arena.allocator.alloc([]const u8, 1 + 2 * cli.positionals.len);
+            header_set[0] = "https://api.github.com/search/repositories?q=topic:zig-package";
+
+            for (cli.positionals) |search_text, i| {
+                header_set[2 * i + 1] = "%20";
+                header_set[2 * i + 2] = try uri.escapeString(&string_arena.allocator, search_text);
+            }
+
+            const request_string = try std.mem.concat(&string_arena.allocator, u8, header_set);
+
+            var response = try https.request(allocator, request_string, &headers);
             defer response.deinit();
 
             // {
@@ -178,6 +191,8 @@ pub fn main() anyerror!u8 {
             }
         },
 
+        // git submodule add owner/repo
+        // git submodule update --init --recursive
         .install => |cli| {
             if (cli.positionals.len == 0) {
                 try printUsage();
@@ -189,10 +204,7 @@ pub fn main() anyerror!u8 {
                     const owner = repo_spec[0..split];
                     const repo = repo_spec[split + 1 ..];
 
-                    std.debug.warn("Install (1) {}/{}\n", .{
-                        owner,
-                        repo,
-                    });
+                    try installPackage(allocator, std.fs.cwd(), repo_spec);
                 } else {
                     const repo = repo_spec;
 
@@ -204,6 +216,8 @@ pub fn main() anyerror!u8 {
             }
         },
 
+        // git rm -rf ./reponame
+        // rm -rf ./.git/modules/reponame/
         .uninstall => |cli| {},
     }
 
@@ -211,6 +225,9 @@ pub fn main() anyerror!u8 {
 }
 
 fn printPackages(root: std.json.Value) !void {
+    const stdout = std.io.getStdOut().outStream();
+    const stderr = std.io.getStdErr().outStream();
+
     if (root != .Object)
         return error.UnexpectedValue;
     if (root.Object.get("items")) |items_kv| {
@@ -224,18 +241,81 @@ fn printPackages(root: std.json.Value) !void {
 
             const licence = repo.get("license").?.value;
             if (licence == .Null) {
-                std.debug.warn("{} (no licence)\n", .{
+                try stdout.print("{} (no licence)\n", .{
                     repo.get("full_name").?.value.String,
                 });
             } else {
-                std.debug.warn("{} ({})\n", .{
+                try stdout.print("{} ({})\n", .{
                     repo.get("full_name").?.value.String,
                     licence.Object.get("name").?.value.String,
+                });
+            }
+
+            if (repo.get("description")) |description| {
+                try stdout.print("\t{}\n", .{
+                    description.value.String,
                 });
             }
         }
     } else {
         return error.UnexpectedValue;
+    }
+}
+
+fn installPackage(allocator: *std.mem.Allocator, target_dir: std.fs.Dir, full_name: []const u8) !void {
+    const stdout = std.io.getStdOut().outStream();
+    const stderr = std.io.getStdErr().outStream();
+
+    const split = std.mem.indexOf(u8, full_name, "/") orelse return error.InvalidRepoName;
+    const owner = full_name[0..split];
+    const repo = full_name[split + 1 ..];
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const github_url = try std.mem.concat(&arena.allocator, u8, &[_][]const u8{
+        "https://github.com/",
+        owner,
+        "/",
+        repo,
+    });
+
+    if (target_dir.openDir(repo, .{})) |*dir| {
+        dir.close();
+        return error.AlreadyExists;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => |e| return e,
+    }
+
+    var git = try std.ChildProcess.init(&[_][]const u8{
+        "git",
+        "submodule",
+        "add",
+        github_url,
+    }, allocator);
+    defer git.deinit();
+
+    switch (try git.spawnAndWait()) {
+        .Exited => |code| {
+            if (code != 0) {
+                try stderr.print("Failed to install package {}\n", .{
+                    full_name,
+                });
+            }
+        },
+        .Signal => |code| {
+            try stderr.print("git signal: {}\n", .{code});
+            return error.InstallFailure;
+        },
+        .Stopped => |code| {
+            try stderr.print("git stopped: {}\n", .{code});
+            return error.InstallFailure;
+        },
+        .Unknown => |code| {
+            try stderr.print("git unknown failure: {}\n", .{code});
+            return error.InstallFailure;
+        },
     }
 }
 
@@ -321,9 +401,9 @@ const https = struct {
                 break event;
             } else unreachable;
 
-            std.debug.warn("http event: {}\n", .{
-                @as(http.EventTag, event),
-            });
+            // std.debug.warn("http event: {}\n", .{
+            //     @as(http.EventTag, event),
+            // });
 
             switch (event) {
                 .Response => |*responseEvent| {
@@ -408,7 +488,6 @@ const https = struct {
 
                 try ssl_client.reset(hostname_z, false); // pass the hostname here
 
-                // this needs to be improved by using actual zig streams
                 var ssl_stream = ssl.initStream(
                     ssl_client.getEngine(),
                     &tcp_in,
