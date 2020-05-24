@@ -479,6 +479,7 @@ fn installPackageInternal(allocator: *std.mem.Allocator, target_dir: std.fs.Dir,
                 github_url,
                 "--depth",
                 "1",
+                "--recursive",
             }, target_dir, allocator);
             // rm -rf zig-args/.git
 
