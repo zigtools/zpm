@@ -38,20 +38,17 @@ const InstallOptions = struct {
     mode: InstallMode = .submodule,
 };
 const SearchOptions = struct {};
-const UninstallOptions = struct {};
 
 const CommandLineInterface = union(enum) {
     help: args_parser.ParseArgsResult(HelpOptions),
     install: args_parser.ParseArgsResult(InstallOptions),
     search: args_parser.ParseArgsResult(SearchOptions),
-    uninstall: args_parser.ParseArgsResult(UninstallOptions),
 
     fn deinit(self: @This()) void {
         switch (self) {
             .help => |v| v.deinit(),
             .install => |v| v.deinit(),
             .search => |v| v.deinit(),
-            .uninstall => |v| v.deinit(),
         }
     }
 };
@@ -128,9 +125,6 @@ pub fn main() anyerror!u8 {
         },
         .install => CommandLineInterface{
             .install = try args_parser.parse(InstallOptions, &args, allocator),
-        },
-        .uninstall => CommandLineInterface{
-            .uninstall = try args_parser.parse(UninstallOptions, &args, allocator),
         },
     };
     defer base_cli.deinit();
@@ -342,10 +336,6 @@ pub fn main() anyerror!u8 {
 
             return if (success) @as(u8, 0) else @as(u8, 1);
         },
-
-        // git rm -rf ./reponame
-        // rm -rf ./.git/modules/reponame/
-        .uninstall => |cli| {},
     }
 
     return 0;
