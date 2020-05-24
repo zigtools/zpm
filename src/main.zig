@@ -174,13 +174,73 @@ pub fn main() anyerror!u8 {
             var target_dir = try std.fs.cwd().openDir(".", .{});
             defer target_dir.close();
 
+            var string_arena = std.heap.ArenaAllocator.init(allocator);
+            defer string_arena.deinit();
+
+            var installed_packages = std.ArrayList(InstalledPackage).init(allocator);
+            defer installed_packages.deinit();
+
+            blk: {
+                var file: std.fs.File = target_dir.openFile("packages.zig", .{ .read = true }) catch |err| switch (err) {
+                    error.FileNotFound => {
+                        try stderr.writeAll("packages.zig not found. Initializing new package store!\n");
+                        break :blk;
+                    },
+                    else => |e| return e,
+                };
+                defer file.close();
+
+                const file_data = try file.inStream().readAllAlloc(allocator, 1024 * 1024);
+
+                var iter = std.mem.split(file_data, "\n");
+
+                var reading_data = false;
+                while (iter.next()) |line| {
+                    if (reading_data) {
+                        if (std.mem.endsWith(u8, line, "//end list")) {
+                            break;
+                        }
+                        if (std.mem.endsWith(u8, line, "// begin pkg")) {
+                            // we assume correct file format here
+                            var decl_line = iter.next() orelse unreachable;
+                            var name_line = iter.next() orelse unreachable;
+                            var path_line = iter.next() orelse unreachable;
+                            var deps_line = iter.next() orelse unreachable;
+                            var semicolon_line = iter.next() orelse unreachable;
+                            var end_line = iter.next() orelse unreachable;
+
+                            std.debug.assert(std.mem.endsWith(u8, semicolon_line, "};"));
+                            std.debug.assert(std.mem.endsWith(u8, end_line, "// end pkg"));
+
+                            var name = name_line[std.mem.indexOf(u8, name_line, "\"").? + 1 .. std.mem.lastIndexOf(u8, name_line, "\"").?];
+                            var path = path_line[std.mem.indexOf(u8, path_line, "\"").? + 1 .. std.mem.lastIndexOf(u8, path_line, "\"").?];
+
+                            // std.debug.warn("'{}', '{}'\n", .{ name, path });
+
+                            var pkg = InstalledPackage{
+                                .name = try std.mem.dupe(&string_arena.allocator, u8, name),
+                                .path = try std.mem.dupe(&string_arena.allocator, u8, path),
+                                .dependencies = {},
+                            };
+
+                            try installed_packages.append(pkg);
+                        }
+                    } else {
+                        reading_data = std.mem.endsWith(u8, line, "// begin list");
+                    }
+                }
+
+                std.debug.assert(reading_data);
+            }
+
+            var success = true;
+
             for (cli.positionals) |repo_spec| {
                 if (std.mem.indexOf(u8, repo_spec, "/")) |split| {
                     const owner = repo_spec[0..split];
                     const repo = repo_spec[split + 1 ..];
 
-                    if ((try installPackage(allocator, target_dir, repo_spec, cli.options.mode)) == false)
-                        return 1;
+                    success = success and try installPackage(allocator, target_dir, repo_spec, cli.options.mode);
                 } else {
                     const repo = repo_spec;
 
@@ -199,8 +259,15 @@ pub fn main() anyerror!u8 {
                             return 1;
                         },
                         1 => {
-                            if ((try installPackage(allocator, target_dir, packages.items[0].full_name, cli.options.mode)) == false)
-                                return 1;
+                            if (try installPackage(allocator, target_dir, packages.items[0].full_name, cli.options.mode)) {
+                                try installed_packages.append(InstalledPackage{
+                                    .name = try std.mem.dupe(&string_arena.allocator, u8, packages.items[0].name),
+                                    .path = try std.mem.dupe(&string_arena.allocator, u8, packages.items[0].name),
+                                    .dependencies = {},
+                                });
+                            } else {
+                                success = false;
+                            }
                         },
                         else => {
                             try stdout.writeAll("Multiple packages were found. Chose one of those:\n");
@@ -238,12 +305,42 @@ pub fn main() anyerror!u8 {
                                 }
                             } else unreachable;
 
-                            if ((try installPackage(allocator, target_dir, packages.items[package_id].full_name, cli.options.mode)) == false)
-                                return 1;
+                            if (try installPackage(allocator, target_dir, packages.items[package_id].full_name, cli.options.mode)) {
+                                try installed_packages.append(InstalledPackage{
+                                    .name = try std.mem.dupe(&string_arena.allocator, u8, packages.items[package_id].name),
+                                    .path = try std.mem.dupe(&string_arena.allocator, u8, packages.items[package_id].name),
+                                    .dependencies = {},
+                                });
+                            } else {
+                                success = false;
+                            }
                         },
                     }
                 }
             }
+
+            {
+                var file = try target_dir.createFile("packages.zig", .{ .exclusive = false });
+                defer file.close();
+
+                var out = file.outStream();
+
+                try out.writeAll(packages_file_template_prefix);
+
+                for (installed_packages.items) |pkg| {
+                    try out.writeAll("    // begin pkg\n");
+                    try out.print("    const @\"{}\" = std.build.Pkg {{\n", .{pkg.name});
+                    try out.print("        .name = \"{}\",\n", .{pkg.name});
+                    try out.print("        .path = \"{}\",\n", .{pkg.path});
+                    try out.print("        .dependencies = null,\n", .{});
+                    try out.writeAll("    };\n");
+                    try out.writeAll("    // end pkg\n");
+                }
+
+                try out.writeAll(packages_file_template_postfix);
+            }
+
+            return if (success) @as(u8, 0) else @as(u8, 1);
         },
 
         // git rm -rf ./reponame
@@ -253,6 +350,12 @@ pub fn main() anyerror!u8 {
 
     return 0;
 }
+
+const InstalledPackage = struct {
+    name: []const u8,
+    path: []const u8,
+    dependencies: void, // empty for now, to be done later?!
+};
 
 const Package = struct {
     name: []const u8,
@@ -420,6 +523,12 @@ fn installPackage(allocator: *std.mem.Allocator, target_dir: std.fs.Dir, full_na
             });
             return false;
         },
+        error.AlreadyExists => {
+            try stderr.print("Package {} already exists!\n", .{
+                full_name,
+            });
+            return false;
+        },
         else => |e| return e,
     };
     return true;
@@ -453,7 +562,6 @@ fn installPackageInternal(allocator: *std.mem.Allocator, target_dir: std.fs.Dir,
 
     switch (install_mode) {
         .submodule => {
-
             // git submodule add owner/repo
             try runGit(&[_][]const u8{
                 "git",
@@ -757,3 +865,26 @@ const https = struct {
         }
     };
 };
+
+const packages_file_template_prefix =
+    \\// zpm package file. do not modify (without knowing what you're doing)!
+    \\const std = @import("std");
+    \\
+    \\pub fn get(comptime name: []const u8) std.build.Pkg {
+    \\    return @field(packages, name);
+    \\}
+    \\
+    \\pub fn addAllTo(exe: *std.build.LibExeObjStep) void {
+    \\    inline for (std.meta.declarations(packages)) |decl| {
+    \\        exe.addPackage(@field(packages, decl.name));
+    \\    }
+    \\}
+    \\
+    \\const packages = struct { // begin list
+    \\
+;
+
+const packages_file_template_postfix =
+    \\}; // end list
+    \\
+;

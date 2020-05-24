@@ -16,3 +16,6 @@
 [submodule "lib/known-folders"]
 	path = lib/known-folders
 	url = https://github.com/ziglibs/known-folders
+[submodule "test-area/zig-args"]
+	path = test-area/zig-args
+	url = https://github.com/MasterQ32/zig-args
