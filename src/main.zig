@@ -11,8 +11,8 @@ fn printUsage() !void {
     const stderr = std.io.getStdErr().outStream();
     try stderr.writeAll(
         \\Usage:
-        \\  zpm [mode] ...
-        \\Mode may be one of the following:
+        \\  zpm [verb] ...
+        \\Verb may be one of the following:
         \\  help
         \\    Lists this help text
         \\  search <words>
@@ -23,6 +23,10 @@ fn printUsage() !void {
         \\    (2) `zpm install creator/package-name`
         \\    When using (1), the package will be installed directly when only one package with that
         \\    name is found. Otherwise, you will be queried to chose on of the options.
+        \\    Options:
+        \\    --mode <mode>   - Mode may be `submodule` or `copy`. submodule will add the package as
+        \\                      a submodule, copy will only add the files from the remote repo.
+        \\                      Default mode is `submodule`.
         \\
     );
 }
@@ -30,7 +34,9 @@ fn printUsage() !void {
 const CliMode = @TagType(CommandLineInterface);
 
 const HelpOptions = struct {};
-const InstallOptions = struct {};
+const InstallOptions = struct {
+    mode: InstallMode = .submodule,
+};
 const SearchOptions = struct {};
 const UninstallOptions = struct {};
 
@@ -159,21 +165,22 @@ pub fn main() anyerror!u8 {
                 });
             }
         },
-
-        // git submodule add owner/repo
-        // git submodule update --init --recursive
         .install => |cli| {
             if (cli.positionals.len == 0) {
                 try printUsage();
                 return 1;
             }
 
+            var target_dir = try std.fs.cwd().openDir(".", .{});
+            defer target_dir.close();
+
             for (cli.positionals) |repo_spec| {
                 if (std.mem.indexOf(u8, repo_spec, "/")) |split| {
                     const owner = repo_spec[0..split];
                     const repo = repo_spec[split + 1 ..];
 
-                    try installPackage(allocator, std.fs.cwd(), repo_spec);
+                    if ((try installPackage(allocator, target_dir, repo_spec, cli.options.mode)) == false)
+                        return 1;
                 } else {
                     const repo = repo_spec;
 
@@ -192,7 +199,8 @@ pub fn main() anyerror!u8 {
                             return 1;
                         },
                         1 => {
-                            try installPackage(allocator, std.fs.cwd(), packages.items[0].full_name);
+                            if ((try installPackage(allocator, target_dir, packages.items[0].full_name, cli.options.mode)) == false)
+                                return 1;
                         },
                         else => {
                             try stdout.writeAll("Multiple packages were found. Chose one of those:\n");
@@ -230,7 +238,8 @@ pub fn main() anyerror!u8 {
                                 }
                             } else unreachable;
 
-                            try installPackage(allocator, std.fs.cwd(), packages.items[package_id].full_name);
+                            if ((try installPackage(allocator, target_dir, packages.items[package_id].full_name, cli.options.mode)) == false)
+                                return 1;
                         },
                     }
                 }
@@ -396,7 +405,27 @@ fn printPackages(root: std.json.Value) !void {
     }
 }
 
-fn installPackage(allocator: *std.mem.Allocator, target_dir: std.fs.Dir, full_name: []const u8) !void {
+const InstallMode = enum {
+    submodule,
+    copy,
+};
+
+fn installPackage(allocator: *std.mem.Allocator, target_dir: std.fs.Dir, full_name: []const u8, install_mode: InstallMode) !bool {
+    const stderr = std.io.getStdErr().outStream();
+
+    installPackageInternal(allocator, target_dir, full_name, install_mode) catch |err| switch (err) {
+        error.InstallFailure => {
+            try stderr.print("Failed to install package {}\n", .{
+                full_name,
+            });
+            return false;
+        },
+        else => |e| return e,
+    };
+    return true;
+}
+
+fn installPackageInternal(allocator: *std.mem.Allocator, target_dir: std.fs.Dir, full_name: []const u8, install_mode: InstallMode) !void {
     const stdout = std.io.getStdOut().outStream();
     const stderr = std.io.getStdErr().outStream();
 
@@ -422,20 +451,54 @@ fn installPackage(allocator: *std.mem.Allocator, target_dir: std.fs.Dir, full_na
         else => |e| return e,
     }
 
-    var git = try std.ChildProcess.init(&[_][]const u8{
-        "git",
-        "submodule",
-        "add",
-        github_url,
-    }, allocator);
+    switch (install_mode) {
+        .submodule => {
+
+            // git submodule add owner/repo
+            try runGit(&[_][]const u8{
+                "git",
+                "submodule",
+                "add",
+                github_url,
+            }, target_dir, allocator);
+
+            // git submodule update --init --recursive
+            try runGit(&[_][]const u8{
+                "git",
+                "submodule",
+                "update",
+                "--init",
+                "--recursive",
+            }, target_dir, allocator);
+        },
+        .copy => {
+            // git clone https://github.com/MasterQ32/zig-args --depth=1
+            var git = try runGit(&[_][]const u8{
+                "git",
+                "clone",
+                github_url,
+                "--depth",
+                "1",
+            }, target_dir, allocator);
+            // rm -rf zig-args/.git
+
+            const subdir = try target_dir.openDir(repo, .{});
+            try subdir.deleteTree(".git");
+        },
+    }
+}
+
+fn runGit(args: []const []const u8, target_dir: std.fs.Dir, allocator: *std.mem.Allocator) !void {
+    const stderr = std.io.getStdErr().outStream();
+
+    var git = try std.ChildProcess.init(args, allocator);
+    git.cwd_dir = target_dir;
     defer git.deinit();
 
     switch (try git.spawnAndWait()) {
         .Exited => |code| {
             if (code != 0) {
-                try stderr.print("Failed to install package {}\n", .{
-                    full_name,
-                });
+                return error.InstallFailure;
             }
         },
         .Signal => |code| {
