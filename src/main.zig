@@ -223,8 +223,8 @@ fn performUpdate(zpm_dir: std.fs.Dir) !void {
         for (packages.items) |item| {
             if (item.kind != .default and item.kind != .combo)
                 continue;
-            try writer.print("    pub const {s} = std.build.Pkg{{\n", .{
-                item.name,
+            try writer.print("    pub const {} = std.build.Pkg{{\n", .{
+                std.zig.fmtId(item.name),
             });
             try writer.print("        .name = \"{s}\",\n", .{item.name});
             try writer.print("        .path = .{{ .path = pkgRoot() ++ \"/{s}\" }},\n", .{item.path});
@@ -251,8 +251,8 @@ fn performUpdate(zpm_dir: std.fs.Dir) !void {
         for (packages.items) |item| {
             if (item.kind != .build and item.kind != .combo)
                 continue;
-            try writer.print("    pub const {s} = @import(\"{s}\");\n", .{
-                item.name,
+            try writer.print("    pub const {} = @import(\"{s}\");\n", .{
+                std.zig.fmtId(item.name),
                 item.path,
             });
         }
