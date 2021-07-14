@@ -1,0 +1,36 @@
+name: Continuous Build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  schedule:
+    - cron: "0 5 * * *" # run at 5 AM UTC
+
+jobs:
+  native-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        host:
+          [
+            ubuntu-latest,
+            macos-latest,
+            windows-latest
+          ]
+
+    runs-on: ${{matrix.host}}
+
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          submodules: "recursive"
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v1
+        with:
+          version: master
+
+      - name: Build
+        run: zig build install
