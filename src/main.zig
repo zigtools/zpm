@@ -212,6 +212,10 @@ fn performUpdate(zpm_dir: std.fs.Dir) !void {
         try writer.writeAll(
             \\const std = @import("std");
             \\
+            \\fn pkgRoot() []const u8 {
+            \\    return std.fs.path.dirname(@src().file) orelse ".";
+            \\}
+            \\
             \\pub const pkgs = struct {
             \\
         );
@@ -222,7 +226,7 @@ fn performUpdate(zpm_dir: std.fs.Dir) !void {
                 item.name,
             });
             try writer.print("        .name = \"{s}\",\n", .{item.name});
-            try writer.print("        .path = .{{ .path = \"{s}\" }},\n", .{item.path});
+            try writer.print("        .path = .{{ .path = pkgRoot() ++ \"/{s}\" }},\n", .{item.path});
             try writer.writeAll("        .dependencies = &[_]std.build.Pkg{");
             for (item.deps) |dep, i| {
                 if (i > 0) {

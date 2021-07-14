@@ -1,0 +1,7 @@
+[ini]
+file = ../lib/ini/src/ini.zig
+deps = args
+
+[custom]
+file = ../src/main.zig
+kind = build
