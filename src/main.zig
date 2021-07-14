@@ -1,880 +1,372 @@
 const std = @import("std");
-
-const network = @import("network");
-const ssl = @import("bearssl");
-const http = @import("h11");
 const uri = @import("uri");
+const ini = @import("ini");
 const args_parser = @import("args");
-const known_folders = @import("known-folders");
 
-fn printUsage() !void {
-    const stderr = std.io.getStdErr().outStream();
-    try stderr.writeAll(
-        \\Usage:
-        \\  zpm [verb] ...
-        \\Verb may be one of the following:
-        \\  help
-        \\    Lists this help text
-        \\  search <words>
-        \\    Searches for packages on GitHub. If no <words> are given, *all* packages are listed.
-        \\  install <repo>
-        \\    Installs the repository <repo>. May be only the repo name or the full repository name:
-        \\    (1) `zpm install package-name`
-        \\    (2) `zpm install creator/package-name`
-        \\    When using (1), the package will be installed directly when only one package with that
-        \\    name is found. Otherwise, you will be queried to chose on of the options.
-        \\    Options:
-        \\    --mode <mode>   - Mode may be `submodule` or `copy`. submodule will add the package as
-        \\                      a submodule, copy will only add the files from the remote repo.
-        \\                      Default mode is `submodule`.
-        \\
-    );
-}
+const logger = std.log;
 
-const CliMode = @TagType(CommandLineInterface);
+var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+const global_allocator = &gpa.allocator;
 
-const HelpOptions = struct {};
-const InstallOptions = struct {
-    mode: InstallMode = .submodule,
+const SelectedCommand = union(enum) {
+    help: args_parser.ParseArgsResult(HelpArgs),
+    init: args_parser.ParseArgsResult(InitArgs),
+    update: args_parser.ParseArgsResult(UpdateArgs),
+
+    const HelpArgs = struct {};
+    const InitArgs = struct {
+        help: bool = false,
+    };
+    const UpdateArgs = struct {
+        help: bool = false,
+    };
 };
-const SearchOptions = struct {};
 
-const CommandLineInterface = union(enum) {
-    help: args_parser.ParseArgsResult(HelpOptions),
-    install: args_parser.ParseArgsResult(InstallOptions),
-    search: args_parser.ParseArgsResult(SearchOptions),
+pub fn main() !u8 {
+    defer _ = gpa.deinit();
 
-    fn deinit(self: @This()) void {
-        switch (self) {
-            .help => |v| v.deinit(),
-            .install => |v| v.deinit(),
-            .search => |v| v.deinit(),
+    const stderr = std.io.getStdErr().writer();
+    const stdout = std.io.getStdOut().writer();
+
+    var command = blk: {
+        var parser = std.process.args();
+
+        const exe_name = try (parser.next(global_allocator) orelse return 1);
+        defer global_allocator.free(exe_name);
+
+        const verb = try (parser.next(global_allocator) orelse {
+            try printUsage(stderr);
+            return 1;
+        });
+        defer global_allocator.free(verb);
+
+        if (std.mem.eql(u8, verb, "help")) {
+            break :blk SelectedCommand{ .help = args_parser.parse(
+                SelectedCommand.HelpArgs,
+                &parser,
+                global_allocator,
+                .print,
+            ) catch return 1 };
+        } else if (std.mem.eql(u8, verb, "init")) {
+            break :blk SelectedCommand{ .init = args_parser.parse(
+                SelectedCommand.InitArgs,
+                &parser,
+                global_allocator,
+                .print,
+            ) catch return 1 };
+        } else if (std.mem.eql(u8, verb, "update")) {
+            break :blk SelectedCommand{ .update = args_parser.parse(
+                SelectedCommand.UpdateArgs,
+                &parser,
+                global_allocator,
+                .print,
+            ) catch return 1 };
         }
-    }
-};
 
-var debug_file: ?std.fs.File = null;
-
-pub fn main() anyerror!u8 {
-    var tester = std.testing.LeakCountAllocator.init(std.heap.c_allocator);
-    defer tester.validate() catch {};
-
-    const allocator = if (std.builtin.mode == .Debug)
-        &tester.allocator
-    else
-        std.heap.c_allocator;
-
-    try network.init();
-    defer network.deinit();
-
-    // this requires usage of HTTPS
-    https.trust_anchors = ssl.TrustAnchorCollection.init(allocator);
-    defer {
-        https.trust_anchors.?.deinit();
-        https.trust_anchors = null;
-    }
-
-    // Just embed our trust_anchor into the binary...
-    // Not perfect, but will work for now.
-    try https.trust_anchors.?.appendFromPEM(
-        @embedFile("../data/digi-cert-github-chain.pem"),
-    );
-
-    var exe_dir = (try known_folders.open(allocator, .executable_dir, .{})) orelse unreachable; // this path does always exist
-    defer exe_dir.close();
-
-    const stdout = std.io.getStdOut().outStream();
-    const stderr = std.io.getStdErr().outStream();
-    const stdin = std.io.getStdIn().inStream();
-
-    // debug_file = try std.fs.cwd().createFile("raw.txt", .{});
-    // defer debug_file.close();
-
-    var args = std.process.args();
-
-    // Ignore executable name for now…
-    {
-        const executable_name = try (args.next(allocator) orelse {
-            try std.io.getStdErr().outStream().writeAll("Failed to get executable name from the argument list!\n");
-            return error.NoExecutableName;
-        });
-        allocator.free(executable_name);
-    }
-
-    const mode = blk: {
-        const mode_name = try (args.next(allocator) orelse {
-            try printUsage();
-            return 1;
-        });
-        defer allocator.free(mode_name);
-
-        break :blk std.meta.stringToEnum(CliMode, mode_name) orelse {
-            try stderr.print("Unknown mode: {}\n", .{
-                mode_name,
-            });
-            return 1;
-        };
+        try stderr.print("Unknown verb: {s}\n", .{verb});
+        return 1;
+    };
+    defer switch (command) {
+        .help => |*cmd| cmd.deinit(),
+        .init => |*cmd| cmd.deinit(),
+        .update => |*cmd| cmd.deinit(),
     };
 
-    const base_cli: CommandLineInterface = switch (mode) {
-        .help => CommandLineInterface{
-            .help = try args_parser.parse(HelpOptions, &args, allocator),
-        },
-        .search => CommandLineInterface{
-            .search = try args_parser.parse(SearchOptions, &args, allocator),
-        },
-        .install => CommandLineInterface{
-            .install = try args_parser.parse(InstallOptions, &args, allocator),
-        },
-    };
-    defer base_cli.deinit();
-
-    switch (base_cli) {
-        .help => |cli| {
-            try printUsage();
+    switch (command) {
+        .help => {
+            try printUsage(stdout);
             return 0;
         },
-
-        .search => |cli| {
-            var headers = https.HeaderMap.init(allocator);
-            defer headers.deinit();
-
-            var packages = queryPackages(allocator, cli.positionals) catch |err| switch (err) {
-                error.UnexpectedValue => {
-                    try stderr.writeAll("Received a JSON structure that does not fit the previous API structure.\nGitHub may have changed something in their API!");
-                    return 1;
-                },
-                else => return err,
-            };
-            defer packages.deinit();
-
-            for (packages.items) |pkg| {
-                const lic = pkg.licence orelse @as([]const u8, "no licence");
-                const desc = pkg.description orelse "no description";
-
-                try stdout.print("{} ({})\n\t{}\n", .{
-                    pkg.full_name,
-                    lic,
-                    desc,
-                });
-            }
+        .init => |cmd| {
+            return try initPackage(cmd);
         },
-        .install => |cli| {
-            if (cli.positionals.len == 0) {
-                try printUsage();
-                return 1;
-            }
-
-            var target_dir = try std.fs.cwd().openDir(".", .{});
-            defer target_dir.close();
-
-            var string_arena = std.heap.ArenaAllocator.init(allocator);
-            defer string_arena.deinit();
-
-            var installed_packages = std.ArrayList(InstalledPackage).init(allocator);
-            defer installed_packages.deinit();
-
-            blk: {
-                var file: std.fs.File = target_dir.openFile("packages.zig", .{ .read = true }) catch |err| switch (err) {
-                    error.FileNotFound => {
-                        try stderr.writeAll("packages.zig not found. Initializing new package store!\n");
-                        break :blk;
-                    },
-                    else => |e| return e,
-                };
-                defer file.close();
-
-                const file_data = try file.inStream().readAllAlloc(allocator, 1024 * 1024);
-
-                var iter = std.mem.split(file_data, "\n");
-
-                var reading_data = false;
-                while (iter.next()) |line| {
-                    if (reading_data) {
-                        if (std.mem.endsWith(u8, line, "//end list")) {
-                            break;
-                        }
-                        if (std.mem.endsWith(u8, line, "// begin pkg")) {
-                            // we assume correct file format here
-                            var decl_line = iter.next() orelse unreachable;
-                            var name_line = iter.next() orelse unreachable;
-                            var path_line = iter.next() orelse unreachable;
-                            var deps_line = iter.next() orelse unreachable;
-                            var semicolon_line = iter.next() orelse unreachable;
-                            var end_line = iter.next() orelse unreachable;
-
-                            std.debug.assert(std.mem.endsWith(u8, semicolon_line, "};"));
-                            std.debug.assert(std.mem.endsWith(u8, end_line, "// end pkg"));
-
-                            var name = name_line[std.mem.indexOf(u8, name_line, "\"").? + 1 .. std.mem.lastIndexOf(u8, name_line, "\"").?];
-                            var path = path_line[std.mem.indexOf(u8, path_line, "\"").? + 1 .. std.mem.lastIndexOf(u8, path_line, "\"").?];
-
-                            // std.debug.warn("'{}', '{}'\n", .{ name, path });
-
-                            var pkg = InstalledPackage{
-                                .name = try std.mem.dupe(&string_arena.allocator, u8, name),
-                                .path = try std.mem.dupe(&string_arena.allocator, u8, path),
-                                .dependencies = {},
-                            };
-
-                            try installed_packages.append(pkg);
-                        }
-                    } else {
-                        reading_data = std.mem.endsWith(u8, line, "// begin list");
-                    }
-                }
-
-                std.debug.assert(reading_data);
-            }
-
-            var success = true;
-
-            for (cli.positionals) |repo_spec| {
-                if (std.mem.indexOf(u8, repo_spec, "/")) |split| {
-                    const owner = repo_spec[0..split];
-                    const repo = repo_spec[split + 1 ..];
-
-                    success = success and try installPackage(allocator, target_dir, repo_spec, cli.options.mode);
-                } else {
-                    const repo = repo_spec;
-
-                    var packages = queryPackages(allocator, cli.positionals) catch |err| switch (err) {
-                        error.UnexpectedValue => {
-                            try stderr.writeAll("Received a JSON structure that does not fit the previous API structure.\nGitHub may have changed something in their API!");
-                            return 1;
-                        },
-                        else => return err,
-                    };
-                    defer packages.deinit();
-
-                    switch (packages.items.len) {
-                        0 => {
-                            try stderr.print("Package {} not found!\n", .{repo});
-                            return 1;
-                        },
-                        1 => {
-                            if (try installPackage(allocator, target_dir, packages.items[0].full_name, cli.options.mode)) {
-                                try installed_packages.append(InstalledPackage{
-                                    .name = try std.mem.dupe(&string_arena.allocator, u8, packages.items[0].name),
-                                    .path = try std.mem.dupe(&string_arena.allocator, u8, packages.items[0].name),
-                                    .dependencies = {},
-                                });
-                            } else {
-                                success = false;
-                            }
-                        },
-                        else => {
-                            try stdout.writeAll("Multiple packages were found. Chose one of those:\n");
-
-                            for (packages.items) |pkg, i| {
-                                const lic = pkg.licence orelse @as([]const u8, "no licence");
-
-                                try stdout.print("[{}]\t{} ({})\n", .{
-                                    i,
-                                    pkg.full_name,
-                                    lic,
-                                });
-                            }
-
-                            var number_buf: [128]u8 = undefined;
-
-                            const package_id = while (true) {
-                                try stdout.writeAll("select package: ");
-                                const num_or_null = try stdin.readUntilDelimiterOrEof(&number_buf, '\n');
-                                if (num_or_null) |num_str| {
-                                    if (num_str.len == 0) {
-                                        return 1;
-                                    }
-                                    const index = std.fmt.parseInt(usize, num_str, 10) catch |err| {
-                                        try stdout.writeAll("Input a number or empty string!\n");
-                                        continue;
-                                    };
-                                    if (index >= packages.items.len) {
-                                        try stdout.writeAll("Index out of range. Input a number or empty string!\n");
-                                        continue;
-                                    }
-                                    break index;
-                                } else {
-                                    return 1;
-                                }
-                            } else unreachable;
-
-                            if (try installPackage(allocator, target_dir, packages.items[package_id].full_name, cli.options.mode)) {
-                                try installed_packages.append(InstalledPackage{
-                                    .name = try std.mem.dupe(&string_arena.allocator, u8, packages.items[package_id].name),
-                                    .path = try std.mem.dupe(&string_arena.allocator, u8, packages.items[package_id].name),
-                                    .dependencies = {},
-                                });
-                            } else {
-                                success = false;
-                            }
-                        },
-                    }
-                }
-            }
-
-            {
-                var file = try target_dir.createFile("packages.zig", .{ .exclusive = false });
-                defer file.close();
-
-                var out = file.outStream();
-
-                try out.writeAll(packages_file_template_prefix);
-
-                for (installed_packages.items) |pkg| {
-                    try out.writeAll("    // begin pkg\n");
-                    try out.print("    const @\"{}\" = std.build.Pkg {{\n", .{pkg.name});
-                    try out.print("        .name = \"{}\",\n", .{pkg.name});
-                    try out.print("        .path = \"{}\",\n", .{pkg.path});
-                    try out.print("        .dependencies = null,\n", .{});
-                    try out.writeAll("    };\n");
-                    try out.writeAll("    // end pkg\n");
-                }
-
-                try out.writeAll(packages_file_template_postfix);
-            }
-
-            return if (success) @as(u8, 0) else @as(u8, 1);
+        .update => |cmd| {
+            return try updatePackage(cmd);
         },
     }
+}
+
+const zpm_config_dir_name = ".zpm";
+
+fn initPackage(cli_args: args_parser.ParseArgsResult(SelectedCommand.InitArgs)) !u8 {
+    if (cli_args.options.help) {
+        try printUsage(std.io.getStdOut().writer());
+        return 0;
+    }
+
+    std.fs.cwd().makeDir(zpm_config_dir_name) catch |err| switch (err) {
+        error.PathAlreadyExists => {
+            var stderr = std.io.getStdErr().writer();
+            try stderr.writeAll("ZPM was already initialized in this directory!\nRun 'zpm update' to refresh your dependencies!\n");
+            return 1;
+        },
+        else => |e| return e,
+    };
+
+    var dir = try std.fs.cwd().openDir(zpm_config_dir_name, .{});
+    defer dir.close();
+
+    // Create initial set of files
+    for (initial_files) |file_info| {
+        var file = try dir.createFile(file_info.name, .{});
+        defer file.close();
+
+        try file.writeAll(file_info.content);
+    }
+
+    try performUpdate(dir);
 
     return 0;
 }
 
-const InstalledPackage = struct {
-    name: []const u8,
-    path: []const u8,
-    dependencies: void, // empty for now, to be done later?!
-};
+fn findZpmRoot() !?std.fs.Dir {
+    const cwd_path = try std.process.getCwdAlloc(global_allocator);
+    defer global_allocator.free(cwd_path);
+
+    // Search up parent directories until we find build.zig.
+    var dirname: []const u8 = cwd_path;
+    while (true) {
+        var search_dir = try std.fs.cwd().openDir(dirname, .{});
+        defer search_dir.close();
+
+        if (search_dir.openDir(zpm_config_dir_name, .{})) |cfg_dir| {
+            return cfg_dir;
+        } else |err| {
+            switch (err) {
+                error.FileNotFound => {
+                    dirname = std.fs.path.dirname(dirname) orelse return null;
+                },
+                else => |e| return e,
+            }
+        }
+    }
+}
+
+fn updatePackage(cli_args: args_parser.ParseArgsResult(SelectedCommand.UpdateArgs)) !u8 {
+    if (cli_args.options.help) {
+        try printUsage(std.io.getStdOut().writer());
+        return 0;
+    }
+
+    var dir = (try findZpmRoot()) orelse {
+        const stderr = std.io.getStdErr().writer();
+        try stderr.writeAll(
+            \\Could not find .zpm folder in this or any parent directory.
+            \\Make sure you have initialized ZPM correctly!
+            \\
+        );
+        return 1;
+    };
+    defer dir.close();
+
+    try performUpdate(dir);
+    return 0;
+}
+
+fn performUpdate(zpm_dir: std.fs.Dir) !void {
+    var root_dir = try zpm_dir.openDir("..", .{ .iterate = true });
+    errdefer root_dir.close();
+
+    var walker = std.fs.Walker{
+        .stack = std.ArrayList(std.fs.Walker.StackItem).init(global_allocator),
+        .name_buffer = blk: {
+            var name_buffer = std.ArrayList(u8).init(global_allocator);
+            errdefer name_buffer.deinit();
+
+            try name_buffer.appendSlice("..");
+            break :blk name_buffer;
+        },
+    };
+    defer walker.deinit();
+
+    try walker.stack.append(.{
+        .dir_it = root_dir.iterate(),
+        .dirname_len = 2,
+    });
+
+    var arena = std.heap.ArenaAllocator.init(global_allocator);
+    defer arena.deinit();
+
+    var packages = std.ArrayList(Package).init(global_allocator);
+    defer packages.deinit();
+
+    while (try walker.next()) |item| {
+        if (item.kind != .File)
+            continue;
+        if (!std.mem.endsWith(u8, item.basename, ".zpm"))
+            continue;
+
+        loadPackageDesc(&arena.allocator, &packages, item) catch |err| {
+            logger.err("Failed to open {s}: {s}", .{
+                item.path,
+                @errorName(err),
+            });
+        };
+    }
+
+    var package_file = try zpm_dir.createFile("pkgs.zig", .{});
+    defer package_file.close();
+    {
+        const writer = package_file.writer();
+
+        try writer.writeAll(
+            \\const std = @import("std");
+            \\
+            \\pub const pkgs = struct {
+            \\
+        );
+        for (packages.items) |item| {
+            if (item.kind != .default and item.kind != .combo)
+                continue;
+            try writer.print("    pub const {s} = std.build.Pkg{{\n", .{
+                item.name,
+            });
+            try writer.print("        .name = \"{s}\",\n", .{item.name});
+            try writer.print("        .path = .{{ .path = \"{s}\" }},\n", .{item.path});
+            try writer.writeAll("        .dependencies = &[_]std.build.Pkg{");
+            for (item.deps) |dep, i| {
+                if (i > 0) {
+                    try writer.writeAll(", ");
+                }
+                try writer.writeAll(dep);
+            }
+            try writer.writeAll("},\n");
+            try writer.writeAll("    };\n");
+        }
+        try writer.writeAll(
+            \\};
+            \\
+        );
+
+        try writer.writeAll(
+            \\
+            \\pub const imports = struct {
+            \\
+        );
+        for (packages.items) |item| {
+            if (item.kind != .build and item.kind != .combo)
+                continue;
+            try writer.print("    pub const {s} = @import(\"{s}\");\n", .{
+                item.name,
+                item.path,
+            });
+        }
+        try writer.writeAll(
+            \\};
+            \\
+        );
+    }
+}
 
 const Package = struct {
     name: []const u8,
-    full_name: []const u8,
-    description: ?[]const u8,
-    licence: ?[]const u8,
+    path: []const u8,
+    deps: []const []const u8 = &[_][]const u8{},
+    kind: PackageKind = .default,
 };
 
-const PackageCollection = struct {
-    arena: std.heap.ArenaAllocator,
-    items: []Package,
-
-    fn deinit(self: @This()) void {
-        self.arena.deinit();
-    }
+const PackageKind = enum {
+    /// It's a normal package, meant to be consumed by a typical zig application
+    default,
+    /// A build package meant to be imported by build.zig
+    build,
+    /// A package that can be used both at build time as well as runtime.
+    combo,
 };
 
-fn queryPackages(allocator: *std.mem.Allocator, keywords: []const []const u8) !PackageCollection {
-    var headers = https.HeaderMap.init(allocator);
-    defer headers.deinit();
+fn loadPackageDesc(allocator: *std.mem.Allocator, packages: *std.ArrayList(Package), item: std.fs.Walker.Entry) !void {
+    var file = try item.dir.openFile(item.basename, .{});
+    defer file.close();
 
-    try headers.putNoClobber("Accept", "application/vnd.github.mercy-preview+json");
+    var parser = ini.parse(allocator, file.reader());
+    defer parser.deinit();
 
-    var string_arena = std.heap.ArenaAllocator.init(allocator);
-    defer string_arena.deinit();
+    var current_pkg: ?*Package = null;
 
-    var header_set = try string_arena.allocator.alloc([]const u8, 1 + 2 * keywords.len);
-    header_set[0] = "https://api.github.com/search/repositories?q=topic:zig-package";
+    while (try parser.next()) |record| {
+        switch (record) {
+            .section => |heading| {
+                current_pkg = try packages.addOne();
+                errdefer _ = packages.pop();
 
-    for (keywords) |search_text, i| {
-        header_set[2 * i + 1] = "%20";
-        header_set[2 * i + 2] = try uri.escapeString(&string_arena.allocator, search_text);
-    }
-
-    const request_string = try std.mem.concat(&string_arena.allocator, u8, header_set);
-
-    var response = try https.request(allocator, request_string, &headers);
-    defer response.deinit();
-
-    // {
-    //     var file = try std.fs.cwd().createFile("request.txt", .{ .exclusive = false });
-    //     defer file.close();
-
-    //     try file.writeAll(response.buffer);
-    // }
-
-    if (response.statusCode == http.StatusCode.Ok) {
-        var parser = std.json.Parser.init(allocator, false); // don't copy strings, we keep the request
-        parser.deinit();
-
-        var tree = try parser.parse(response.body);
-        defer tree.deinit();
-
-        return try parsePackages(allocator, tree.root);
-    } else {
-        std.debug.warn("Failed to execute query:\n", .{});
-
-        std.debug.warn("status: {}\n", .{response.statusCode});
-        std.debug.warn("headers:\n", .{});
-        for (response.headers) |header| {
-            std.debug.warn("\t{}: {}\n", .{
-                header.name,
-                header.value,
-            });
-        }
-
-        return error.UnexpectedServerResponse;
-    }
-}
-
-fn parsePackages(allocator: *std.mem.Allocator, root: std.json.Value) !PackageCollection {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    errdefer arena.deinit();
-
-    if (root != .Object)
-        return error.UnexpectedValue;
-    if (root.Object.get("items")) |items_kv| {
-        if (items_kv.value != .Array)
-            return error.UnexpectedValue;
-
-        const result = try allocator.alloc(Package, items_kv.value.Array.items.len);
-
-        for (items_kv.value.Array.items) |repo_val, i| {
-            if (repo_val != .Object)
-                return error.UnexpectedValue;
-            const repo = &repo_val.Object;
-
-            const pkg = &result[i];
-            pkg.* = Package{
-                .name = try std.mem.dupe(&arena.allocator, u8, repo.get("name").?.value.String),
-                .full_name = try std.mem.dupe(&arena.allocator, u8, repo.get("full_name").?.value.String),
-                .description = null,
-                .licence = null,
-            };
-
-            const licence = repo.get("license").?.value;
-            if (licence == .Object) {
-                pkg.licence = try std.mem.dupe(&arena.allocator, u8, licence.Object.get("name").?.value.String);
-            }
-
-            if (repo.get("description")) |description| {
-                pkg.description = try std.mem.dupe(&arena.allocator, u8, description.value.String);
-            }
-        }
-
-        return PackageCollection{
-            .arena = arena,
-            .items = result,
-        };
-    } else {
-        return error.UnexpectedValue;
-    }
-}
-
-fn printPackages(root: std.json.Value) !void {
-    const stdout = std.io.getStdOut().outStream();
-    const stderr = std.io.getStdErr().outStream();
-
-    if (root != .Object)
-        return error.UnexpectedValue;
-    if (root.Object.get("items")) |items_kv| {
-        if (items_kv.value != .Array)
-            return error.UnexpectedValue;
-
-        for (items_kv.value.Array.items) |repo_val| {
-            if (repo_val != .Object)
-                return error.UnexpectedValue;
-            const repo = &repo_val.Object;
-
-            const licence = repo.get("license").?.value;
-            if (licence == .Null) {
-                try stdout.print("{} (no licence)\n", .{
-                    repo.get("full_name").?.value.String,
-                });
-            } else {
-                try stdout.print("{} ({})\n", .{
-                    repo.get("full_name").?.value.String,
-                    licence.Object.get("name").?.value.String,
-                });
-            }
-
-            if (repo.get("description")) |description| {
-                try stdout.print("\t{}\n", .{
-                    description.value.String,
-                });
-            }
-        }
-    } else {
-        return error.UnexpectedValue;
-    }
-}
-
-const InstallMode = enum {
-    submodule,
-    copy,
-};
-
-fn installPackage(allocator: *std.mem.Allocator, target_dir: std.fs.Dir, full_name: []const u8, install_mode: InstallMode) !bool {
-    const stderr = std.io.getStdErr().outStream();
-
-    installPackageInternal(allocator, target_dir, full_name, install_mode) catch |err| switch (err) {
-        error.InstallFailure => {
-            try stderr.print("Failed to install package {}\n", .{
-                full_name,
-            });
-            return false;
-        },
-        error.AlreadyExists => {
-            try stderr.print("Package {} already exists!\n", .{
-                full_name,
-            });
-            return false;
-        },
-        else => |e| return e,
-    };
-    return true;
-}
-
-fn installPackageInternal(allocator: *std.mem.Allocator, target_dir: std.fs.Dir, full_name: []const u8, install_mode: InstallMode) !void {
-    const stdout = std.io.getStdOut().outStream();
-    const stderr = std.io.getStdErr().outStream();
-
-    const split = std.mem.indexOf(u8, full_name, "/") orelse return error.InvalidRepoName;
-    const owner = full_name[0..split];
-    const repo = full_name[split + 1 ..];
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
-    const github_url = try std.mem.concat(&arena.allocator, u8, &[_][]const u8{
-        "https://github.com/",
-        owner,
-        "/",
-        repo,
-    });
-
-    if (target_dir.openDir(repo, .{})) |*dir| {
-        dir.close();
-        return error.AlreadyExists;
-    } else |err| switch (err) {
-        error.FileNotFound => {},
-        else => |e| return e,
-    }
-
-    switch (install_mode) {
-        .submodule => {
-            // git submodule add owner/repo
-            try runGit(&[_][]const u8{
-                "git",
-                "submodule",
-                "add",
-                github_url,
-            }, target_dir, allocator);
-
-            // git submodule update --init --recursive
-            try runGit(&[_][]const u8{
-                "git",
-                "submodule",
-                "update",
-                "--init",
-                "--recursive",
-            }, target_dir, allocator);
-        },
-        .copy => {
-            // git clone https://github.com/MasterQ32/zig-args --depth=1
-            var git = try runGit(&[_][]const u8{
-                "git",
-                "clone",
-                github_url,
-                "--depth",
-                "1",
-                "--recursive",
-            }, target_dir, allocator);
-            // rm -rf zig-args/.git
-
-            const subdir = try target_dir.openDir(repo, .{});
-            try subdir.deleteTree(".git");
-        },
-    }
-}
-
-fn runGit(args: []const []const u8, target_dir: std.fs.Dir, allocator: *std.mem.Allocator) !void {
-    const stderr = std.io.getStdErr().outStream();
-
-    var git = try std.ChildProcess.init(args, allocator);
-    git.cwd_dir = target_dir;
-    defer git.deinit();
-
-    switch (try git.spawnAndWait()) {
-        .Exited => |code| {
-            if (code != 0) {
-                return error.InstallFailure;
-            }
-        },
-        .Signal => |code| {
-            try stderr.print("git signal: {}\n", .{code});
-            return error.InstallFailure;
-        },
-        .Stopped => |code| {
-            try stderr.print("git stopped: {}\n", .{code});
-            return error.InstallFailure;
-        },
-        .Unknown => |code| {
-            try stderr.print("git unknown failure: {}\n", .{code});
-            return error.InstallFailure;
-        },
-    }
-}
-
-const https = struct {
-    pub const HeaderMap = std.StringHashMap([]const u8);
-
-    const empty_trust_anchor_set = ssl.TrustAnchorCollection.init(std.testing.failing_allocator);
-
-    /// This contains the TLS trust anchors used to verify servers.
-    /// Using a global trust anchor set should be sufficient for most HTTPs
-    /// stuff.
-    pub var trust_anchors: ?ssl.TrustAnchorCollection = null;
-
-    fn requestWithStream(allocator: *std.mem.Allocator, url: uri.UriComponents, headers: HeaderMap, io_handler: var) !Response {
-        var http_client = http.Client.init(allocator);
-        defer http_client.deinit();
-
-        var request_headers = try allocator.alloc(http.HeaderField, headers.count());
-        defer allocator.free(request_headers);
-
-        var iter = headers.iterator();
-        var i: usize = 0;
-        while (iter.next()) |kv| {
-            request_headers[i] =
-                http.HeaderField{
-                .name = kv.key,
-                .value = kv.value,
-            };
-            i += 1;
-        }
-        std.debug.assert(i == request_headers.len);
-
-        // we know that the URL was parsed from a single string, so
-        // we can reassemble parts of that string again
-        var target = url.path.?;
-        if (url.query) |q| {
-            target = target.ptr[0..((@ptrToInt(q.ptr) - @ptrToInt(target.ptr)) + q.len)];
-        }
-        if (url.fragment) |f| {
-            target = target.ptr[0..((@ptrToInt(f.ptr) - @ptrToInt(target.ptr)) + f.len)];
-        }
-
-        var requestBytes = try http_client.send(http.Event{
-            .Request = http.Request{
-                .method = "GET",
-                .target = target,
-                .headers = request_headers,
+                current_pkg.?.* = .{
+                    .name = try allocator.dupe(u8, heading),
+                    .path = "",
+                    .kind = .default,
+                };
             },
-        });
-        defer allocator.free(requestBytes);
-
-        try io_handler.output.writeAll(requestBytes);
-
-        try io_handler.flush();
-
-        var response = Response.init(allocator);
-
-        while (true) {
-            var event: http.Event = while (true) {
-                var event = http_client.nextEvent() catch |err| switch (err) {
-                    http.EventError.NeedData => {
-                        var responseBuffer: [4096]u8 = undefined;
-
-                        while (true) {
-                            var nBytes = try io_handler.input.read(&responseBuffer);
-                            if (nBytes == 0)
-                                break;
-
-                            const slice = responseBuffer[0..nBytes];
-
-                            if (debug_file) |*file| {
-                                try file.writeAll(slice);
-                            }
-
-                            // std.debug.warn("input({}) => \"{}\"\n", .{ nBytes, responseBuffer[0..nBytes] });
-
-                            try http_client.receiveData(slice);
+            .property => |kv| {
+                if (current_pkg) |pkg| {
+                    if (std.mem.eql(u8, kv.key, "file")) {
+                        pkg.path = try std.fs.path.join(allocator, &[_][]const u8{
+                            std.fs.path.dirname(item.path) orelse ".",
+                            kv.value,
+                        });
+                    } else if (std.mem.eql(u8, kv.key, "kind")) {
+                        pkg.kind = std.meta.stringToEnum(PackageKind, kv.value) orelse {
+                            logger.warn("Unexpected package kind {s}.", .{kv.value});
+                            return error.InvalidFile;
+                        };
+                    } else if (std.mem.eql(u8, kv.key, "deps")) {
+                        var items = std.mem.tokenize(kv.value, " \t,");
+                        var count: usize = 0;
+                        while (items.next()) |_| {
+                            count += 1;
                         }
-                        continue;
-                    },
-                    else => {
-                        return err;
-                    },
-                };
-                break event;
-            } else unreachable;
+                        items.reset();
 
-            // std.debug.warn("http event: {}\n", .{
-            //     @as(http.EventTag, event),
-            // });
+                        var deps = std.ArrayList([]const u8).init(allocator);
+                        try deps.resize(count);
 
-            switch (event) {
-                .Response => |*responseEvent| {
-                    response.statusCode = responseEvent.statusCode;
-                    response.headers = responseEvent.headers;
-                },
-                .Data => |*dataEvent| {
-                    response.body = dataEvent.body;
-                },
-                .EndOfMessage => {
-                    response.buffer = http_client.buffer.toOwnedSlice();
-                    return response;
-                },
-                else => unreachable,
-            }
-        }
-    }
+                        var index: usize = 0;
+                        while (items.next()) |val| {
+                            deps.items[index] = try allocator.dupe(u8, val);
+                            index += 1;
+                        }
 
-    fn tryInsertHeader(headers: *HeaderMap, key: []const u8, value: []const u8) !void {
-        const gop = try headers.getOrPut(key);
-        if (!gop.found_existing) {
-            gop.kv.value = value;
-        }
-    }
-
-    pub fn request(allocator: *std.mem.Allocator, url: []const u8, headers: ?*HeaderMap) !Response {
-        var parsed_url = try uri.parse(url);
-        if (parsed_url.scheme == null)
-            return error.InvalidUrl;
-        if (parsed_url.host == null)
-            return error.InvalidUrl;
-        if (parsed_url.path == null)
-            return error.InvalidUrl;
-
-        var temp_allocator_buffer: [1000]u8 = undefined;
-        var temp_allocator = std.heap.FixedBufferAllocator.init(&temp_allocator_buffer);
-
-        var buffered_headers = HeaderMap.init(&temp_allocator.allocator);
-        defer buffered_headers.deinit();
-
-        const hdrmap = if (headers) |set|
-            set
-        else
-            &buffered_headers;
-
-        try tryInsertHeader(hdrmap, "Host", parsed_url.host.?);
-        try tryInsertHeader(hdrmap, "Accept", "*/*"); // We are generous
-        try tryInsertHeader(hdrmap, "Connection", "close"); // we want the data to end
-        try tryInsertHeader(hdrmap, "User-Agent", "zpm/1.0.0"); // we are ZPM
-        try tryInsertHeader(hdrmap, "Accept-Encoding", "identity"); // we can only read non-chunked data
-
-        const Protocol = enum {
-            http,
-            https,
-        };
-
-        const protocol = if (std.mem.eql(u8, parsed_url.scheme.?, "https"))
-            Protocol.https
-        else if (std.mem.eql(u8, parsed_url.scheme.?, "http"))
-            Protocol.http
-        else
-            return error.UnsupportedProtocol;
-
-        const hostname_z = try std.mem.dupeZ(&temp_allocator.allocator, u8, parsed_url.host.?);
-
-        var socket = try network.connectToHost(allocator, parsed_url.host.?, switch (protocol) {
-            .http => @as(u16, 80),
-            .https => @as(u16, 443),
-        }, .tcp);
-        defer socket.close();
-
-        var tcp_in = socket.inStream();
-        var tcp_out = socket.outStream();
-
-        switch (protocol) {
-            .https => {
-                // When we have no global trust anchors, use empty ones.
-                var x509 = ssl.x509.Minimal.init(if (trust_anchors) |ta| ta else empty_trust_anchor_set);
-
-                var ssl_client = ssl.Client.init(x509.getEngine());
-                ssl_client.relocate();
-
-                try ssl_client.reset(hostname_z, false); // pass the hostname here
-
-                var ssl_stream = ssl.initStream(
-                    ssl_client.getEngine(),
-                    &tcp_in,
-                    &tcp_out,
-                );
-                defer if (ssl_stream.close()) {} else |err| {
-                    std.debug.warn("error when closing the stream: {}\n", .{err});
-                };
-
-                var ssl_in = ssl_stream.inStream();
-                var ssl_out = ssl_stream.outStream();
-
-                const IO = struct {
-                    ssl: *@TypeOf(ssl_stream),
-                    input: @TypeOf(ssl_in),
-                    output: @TypeOf(ssl_out),
-                    fn flush(self: @This()) !void {
-                        try self.ssl.flush();
+                        pkg.deps = deps.toOwnedSlice();
+                    } else {
+                        logger.warn("{s} contains a unknown key: {s}", .{ item.basename, kv.key });
                     }
-                };
-
-                return try requestWithStream(allocator, parsed_url, hdrmap.*, IO{
-                    .ssl = &ssl_stream,
-                    .input = ssl_in,
-                    .output = ssl_out,
-                });
+                } else {
+                    logger.warn("{s} contains keys without a section!", .{item.basename});
+                    return error.InvalidFile;
+                }
             },
-            .http => {
-                const IO = struct {
-                    input: @TypeOf(tcp_in),
-                    output: @TypeOf(tcp_out),
-                    fn flush(self: @This()) !void {}
-                };
-                return try requestWithStream(allocator, parsed_url, hdrmap.*, IO{
-                    .input = tcp_in,
-                    .output = tcp_out,
-                });
+
+            .enumeration => {
+                logger.warn("{s} contains a invalid enumeration!", .{item.basename});
             },
         }
     }
+}
 
-    pub const Response = struct {
-        const Self = @This();
+fn printUsage(stream: anytype) !void {
+    try stream.writeAll(
+        \\zpm [verb] ...
+        \\  verbs:
+        \\    init
+        \\      initializes a new zpm instance
+        \\    update
+        \\      updates an already existing zpm instance
+        \\    help
+        \\      prints this help text
+        \\
+    );
+}
 
-        allocator: *std.mem.Allocator,
-        statusCode: http.StatusCode,
-        headers: []http.HeaderField,
-        body: []const u8,
-        // `buffer` stores the bytes read from the socket.
-        // This allow to keep `headers` and `body` fields accessible after
-        // the client  connection is deinitialized.
-        buffer: []const u8,
-
-        pub fn init(allocator: *std.mem.Allocator) Self {
-            return Self{
-                .allocator = allocator,
-                .statusCode = .ImATeapot,
-                .headers = &[_]http.HeaderField{},
-                .body = &[_]u8{},
-                .buffer = &[_]u8{},
-            };
-        }
-
-        pub fn deinit(self: *Self) void {
-            self.allocator.free(self.headers);
-            self.allocator.free(self.buffer);
-        }
-    };
+const initial_files = [_]PregeneratedFile{
+    // TODO: Do we really want to ignore the pkgs.zig file?
+    // PregeneratedFile{
+    //     .name = ".gitignore",
+    //     .content =
+    //     \\*.zig
+    //     \\
+    //     ,
+    // },
 };
 
-const packages_file_template_prefix =
-    \\// zpm package file. do not modify (without knowing what you're doing)!
-    \\const std = @import("std");
-    \\
-    \\pub fn get(comptime name: []const u8) std.build.Pkg {
-    \\    return @field(packages, name);
-    \\}
-    \\
-    \\pub fn addAllTo(exe: *std.build.LibExeObjStep) void {
-    \\    inline for (std.meta.declarations(packages)) |decl| {
-    \\        exe.addPackage(@field(packages, decl.name));
-    \\    }
-    \\}
-    \\
-    \\const packages = struct { // begin list
-    \\
-;
-
-const packages_file_template_postfix =
-    \\}; // end list
-    \\
-;
+const PregeneratedFile = struct {
+    name: []const u8,
+    content: []const u8,
+};
