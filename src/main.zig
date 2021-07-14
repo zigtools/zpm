@@ -168,7 +168,8 @@ fn performUpdate(zpm_dir: std.fs.Dir) !void {
     errdefer root_dir.close();
 
     var walker = std.fs.Walker{
-        .stack = std.ArrayList(std.fs.Walker.StackItem).init(global_allocator),
+        //       [        std.fs.Walker.StackItem        ]
+        .stack = std.meta.fieldInfo(std.fs.Walker, .stack).field_type.init(global_allocator),
         .name_buffer = blk: {
             var name_buffer = std.ArrayList(u8).init(global_allocator);
             errdefer name_buffer.deinit();
