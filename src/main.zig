@@ -114,7 +114,10 @@ fn initPackage(cli_args: args_parser.ParseArgsResult(SelectedCommand.InitArgs)) 
         try file.writeAll(file_info.content);
     }
 
-    try performUpdate(dir);
+    var config = try loadConfig(global_allocator, dir);
+    defer config.deinit();
+
+    try performUpdate(config, dir);
 
     return 0;
 }
@@ -159,11 +162,14 @@ fn updatePackage(cli_args: args_parser.ParseArgsResult(SelectedCommand.UpdateArg
     };
     defer dir.close();
 
-    try performUpdate(dir);
+    var config = try loadConfig(global_allocator, dir);
+    defer config.deinit();
+
+    try performUpdate(config, dir);
     return 0;
 }
 
-fn performUpdate(zpm_dir: std.fs.Dir) !void {
+fn performUpdate(config: Config, zpm_dir: std.fs.Dir) !void {
     var root_dir = try zpm_dir.openDir("..", .{ .iterate = true });
     errdefer root_dir.close();
 
@@ -205,7 +211,7 @@ fn performUpdate(zpm_dir: std.fs.Dir) !void {
         };
     }
 
-    var package_file = try zpm_dir.createFile("pkgs.zig", .{});
+    var package_file = try zpm_dir.createFile(config.pkgs_file, .{});
     defer package_file.close();
     {
         const writer = package_file.writer();
@@ -346,6 +352,60 @@ fn loadPackageDesc(allocator: *std.mem.Allocator, packages: *std.ArrayList(Packa
     }
 }
 
+const Config = struct {
+    arena: std.heap.ArenaAllocator,
+
+    pkgs_file: []const u8,
+
+    pub fn deinit(self: *@This()) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+fn loadConfig(allocator: *std.mem.Allocator, zpm_dir: std.fs.Dir) !Config {
+    const cfg_log = std.log.scoped(.config);
+
+    var cfg = Config{
+        .arena = std.heap.ArenaAllocator.init(allocator),
+        .pkgs_file = "pkgs.zig",
+    };
+
+    if (zpm_dir.openFile("zpm.conf", .{})) |*file| {
+        defer file.close();
+
+        var parser = ini.parse(allocator, file.reader());
+        defer parser.deinit();
+
+        while (try parser.next()) |record| {
+            switch (record) {
+                .section => |heading| {
+                    cfg_log.warn("unexpected heading [{s}] in the config!", .{heading});
+                },
+                .property => |kv| {
+                    if (std.mem.eql(u8, kv.key, "pkgs-file")) {
+                        cfg.pkgs_file = try cfg.arena.allocator.dupe(u8, kv.value);
+                    } else {
+                        cfg_log.warn("unexpected key '{s}' in the config!", .{kv.key});
+                    }
+                },
+
+                .enumeration => |e| {
+                    cfg_log.warn("unexpected enumeration '{s}' in the config!", .{e});
+                },
+            }
+        }
+    } else |err| {
+        switch (err) {
+            // when file is not found, just use the defaults.
+            error.FileNotFound => {},
+            else => |e| return e,
+        }
+    }
+
+    return cfg;
+}
+
 fn printUsage(stream: anytype) !void {
     try stream.writeAll(
         \\zpm [verb] ...
@@ -369,6 +429,14 @@ const initial_files = [_]PregeneratedFile{
     //     \\
     //     ,
     // },
+    PregeneratedFile{
+        .name = "zpm.conf",
+        .content = 
+        \\# configures the path where the build.zig import file is generated.
+        \\# the path is relative to this file.
+        \\# pkgs-file = ./pkgs.zig
+        ,
+    },
 };
 
 const PregeneratedFile = struct {

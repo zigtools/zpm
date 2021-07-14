@@ -33,6 +33,16 @@ pub const imports = struct {
 };
 ```
 
+### Configuration
+
+ZPM will create a `zpm.conf` file in the `.zpm` directory that can be used to configure the project instance. This config file is a ini file and has the following entries:
+
+```ini
+# configures the path where the build.zig import file is generated.
+# the path is relative to this file.
+pkgs-file = pkgs.zig
+```
+
 ## Add packages
 
 To add a new package, put a `.zpm` file anywhere in your project tree next or below the `.zpm` folder. These files must be ini files where each section declares a package named after the section.
