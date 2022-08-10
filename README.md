@@ -65,4 +65,4 @@ If you change anything in your package declaration files, run `zpm update`.
 ## Contributing
 
 This reboot of ZPM is made to be super-simple, but the implementation might be *too simple* right now. If you feel
-like somthing is missing, feel free to fork and PR!
+like something is missing, feel free to fork and PR!
