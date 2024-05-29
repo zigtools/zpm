@@ -1,0 +1,10 @@
+.{
+    .name = "Zig Package Repository Manager",
+    .version = "0.1.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

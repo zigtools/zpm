@@ -1,3 +1,4 @@
-zig-cache
-*.txt
-zig-out/
+/zig-out/
+/zig-cache/
+/result/
+/.direnv/

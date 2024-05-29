@@ -1,68 +1,170 @@
-# A package composition tool for zig
+# ZPM Next Generation
 
-A package configuration and discovery tool.
+> This project is vaporware right now. If you feel the urge to implement it, go ahead!
 
-## Usage
+## Usage Examples
 
-```sh
-# initializes a zpm instance in the current directory by creating a hidden .zpm folder.
-# packages will then be auto-collected and .zpm/pkgs.zig will be created.
-zpm init 
-
-# re-runs package autodetection and will regenerate .zpm/pkgs.zig
-zpm update
+```sh-session
+[user@host] ~ $ zpm add-index zig.pm https://index.zig.pm/api/v1/
+[user@host] ~ $ 
 ```
 
-After initialization, ZPM will create the folder `.zpm` which contains a file `.zpm/pkgs.zig`. This file contain all collected 
-packages that are available and can be imported into `build.zig`.
+```sh-session
+[user@host] ~ $ zpm search network
 
-It will look roughly like this:
+masterq32/network 1.0.0 @ zig.pm
+  A smallest-common-subset of socket functions for crossplatform networking, TCP & UDP
+
+marler8997/ziget 1.2.3 @ zig.pm
+  Zig library/tool to request network assets
+
+[user@host] ~ $ 
+```
+
+```sh-session
+[user@host] ~ $ zpm add masterq32/network
+Adding masterq32/network...                 [/]
+Done.
+
+Use this code to add the dependency to your project:
+
+    const network_dep = b.dependency("masterq32/network", .{});
+
+    const network_mod = network_dep.module("network");
+
+[user@host] ~ $ 
+```
+
+```sh-session
+[user@host] ~ $ zpm update --auto
+Updating 2 dependencies...                  [/]
+
+    masterq32/network 1.0.0 => 1.0.5
+    masterq32/args    1.4.5 => 1.9.2
+
+[user@host] ~ $ 
+```
+
+```sh-session
+[user@host] ~ $ zpm update --auto --major
+Updating 1 dependency...                    [/]
+
+    masterq32/network 1.0.0 => 2.1.7
+
+[user@host] ~ $ 
+```
+
+```sh-session
+[user@host] ~ $ zpm update
+Updating 1 dependency...                    [/]
+
+    masterq32/network 1.0.0 => 2.1.7 [yN]
+```
+
+```sh-session
+[user@host] ~ $ zpm package
+path: /home/user/.cache/zpm/bundles/network.tar.xz
+hash: 1220a1f050f3a67785cbe68283b252f02f72885eea80d6a9e1856b02cd66deaf1492
+```
+
+```sh-session
+[user@host] ~ $ zpm push
+Uploading masterq32/network to zig.pm...     [/]
+[user@host] ~ $ 
+```
+
+## `build.zig.zon` Extension
+
 ```zig
-const std = @import("std");
+.{
+    .name = "network", // this is displayed after the user name
+    .version = "1.2.3", // this is displayed in the search
+    .dependencies = .{
+        .inner = .{
+            .url = "…",
+            .hash = "…",
 
-pub const pkgs = struct {
-    pub const android = std.build.Pkg{
-        .name = "android",
-        .path = .{ .path = "../vendor/AndroidSdk/source/android.zig" },
-        .dependencies = &[_]std.build.Pkg{},
-    };
-};
-
-pub const imports = struct {
-    pub const AndroidSdk = @import("../vendor/AndroidSdk/Sdk.zig");
-};
+            .index = "zig.pm",                  // which index was used to fetch
+            .package_name = "masterq32/inner",  // what is the package named there
+            .package_version = "0.9.3",         // which version was installed last
+        },
+    },
+    // Where can we fetch our packages?
+    .package_indices = .{
+        .@"zig.pm" = .{
+            .base_url = "https://index.zig.pm/api/v1/",
+        },
+    },
+}
 ```
 
-### Configuration
+## Package Index Format
 
-ZPM will create a `zpm.conf` file in the `.zpm` directory that can be used to configure the project instance. This config file is a ini file and has the following entries:
+### `/index.json`
 
-```ini
-# configures the path where the build.zig import file is generated.
-# the path is relative to this file.
-pkgs-file = pkgs.zig
+Describes the root of a package index.
+
+Should be served with a backend that supports `index.json?search=<query>&sort=<key>` with `<key>` being one of the fields of an entry of `packages` and `<query>` should be able to do a full text search.
+
+```json
+{
+    "last_update": {
+        "unix": "1714076768",
+        "iso": "2024-04-25T20:26:08.690159"
+    },
+    "packages": [
+        {
+            "name": "masterq32/network",
+            "short_desc": "A smallest-common-subset of socket functions for crossplatform networking, TCP & UDP",
+
+            "zig_version": "0.12.0",
+            
+            "pkg_version": "0.11.0-43-ge107f8d11",
+            "pkg_hash": "12203149d62eb94d919582cfd2482a4abd14b7908a69928ec0fe2724969388a2ad01",
+            "pkg_url": "https://downloads.zig.pm/packages/masterq32/network/0.11.0-43-ge107f8d11.tar.xz",
+            "pkg_metadata": "https://downloads.zig.pm/packages/masterq32/network.json"
+        },
+        …
+    ]
+}
 ```
 
-## Add packages
+### `metadata.json`
 
-To add a new package, put a `.zpm` file anywhere in your project tree next or below the `.zpm` folder. These files must be ini files where each section declares a package named after the section.
+This file is served under the url provided at `pkg_metadata` and describes a package more in-depth including
+all published versions and some generic package metadata.
 
-The section allows the following keys:
-```ini
-[zpm]
-file = rel/path/to/source.zig # a path relative to this files folder
-                              # where the package root is located
-deps = args, ini, uri         # comma-separated list of dependencies names
-kind = default                # default = a normal runtime package, available under .pkgs
-                              # build   = the package will be available under .imports 
-                              # combo   = mixed build- and runtime package
+```json
+{
+    "package_name": "masterq32/network",
+    "description": "A smallest-common-subset of socket functions for crossplatform networking, TCP & UDP",
+    "versions": {
+        "0.11.0-43-ge107f8d11": {
+            "package": {
+                "hash": "12200466d72927f83a1e427d04d15e7ab71ab735ae6f175b6dee22bde2d64bab34a3",
+                "url": "https://downloads.zig.pm/packages/masterq32/network/0.11.0-43-ge107f8d11.tar.xz",
+                "files": [
+                    "LICENSE",
+                    "build.zig",
+                    "build.zig.zon",
+                    "src/network.zig"
+                ]
+            },
+            "created": {
+                "unix": "1714076768",
+                "iso": "2024-04-25T20:26:08.690159"
+            },
+            "archive": {
+                "size": "218662",
+                "sha256sum": "786101a5548c7f5687a2f401c9b011badd734b68051c600d6a2a0e31b0bf7629"
+            },
+            "dependencies": {
+                "inner": {
+                    "name": "masterq32/inner",
+                    "version": "0.9.3"
+                },
+            },
+        }
+    }
+}
 ```
-
-These package files don't have to reside next to the package, but can also be declared outside the *package* source tree. This allows to configure external packages in the `.zpm` folder for example.
-
-If you change anything in your package declaration files, run `zpm update`.
-
-## Contributing
-
-This reboot of ZPM is made to be super-simple, but the implementation might be *too simple* right now. If you feel
-like something is missing, feel free to fork and PR!
